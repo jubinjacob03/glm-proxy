@@ -1,0 +1,135 @@
+name: Build Windows Release
+
+on:
+  push:
+    branches:
+      - release
+  workflow_dispatch:
+
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build installer and publish release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve dependencies
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Ensure NSIS is available
+        shell: pwsh
+        run: |
+          $makensis = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "$env:ProgramFiles\NSIS\makensis.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($makensis) {
+            Write-Host "NSIS found at $makensis"
+          }
+          else {
+            Write-Host "NSIS not present on the runner; installing."
+            choco install nsis -y --no-progress
+          }
+
+      - name: Build installer and executables
+        shell: pwsh
+        run: .\make.ps1 installer
+
+      - name: Resolve release version
+        id: version
+        shell: pwsh
+        run: |
+          $nsi = Get-Content installer\installer.nsi -Raw
+          $m = [regex]::Match($nsi, '!define\s+APP_VERSION\s+"([^"]+)"')
+          if (-not $m.Success) { throw "APP_VERSION not found in installer.nsi" }
+          $version = $m.Groups[1].Value
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Release version $version (tag v$version)"
+
+      - name: Collect release notes from commit
+        shell: pwsh
+        run: |
+          git log -1 --pretty=%B | Out-File -FilePath release-notes.md -Encoding utf8
+          Write-Host "--- release notes ---"
+          Get-Content release-notes.md | Write-Host
+
+      - name: Report artifact sizes
+        shell: pwsh
+        run: |
+          Get-ChildItem installer\out, installer\staging -File |
+            Select-Object Name, @{n = 'MB'; e = { [math]::Round($_.Length / 1MB, 2) } } |
+            Format-Table -AutoSize | Out-String | Write-Host
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $assets = @(
+            "installer\out\GLM-Proxy-Setup.exe",
+            "installer\staging\zai-api.exe",
+            "installer\staging\token-collector.exe",
+            "installer\staging\glm-tray.exe"
+          )
+          foreach ($a in $assets) {
+            if (-not (Test-Path $a)) { throw "missing release asset: $a" }
+          }
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag exists; updating notes and re-uploading assets."
+            gh release edit $tag --title "GLM Proxy $tag" --notes-file release-notes.md
+            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
+            gh release upload $tag @assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          }
+          else {
+            Write-Host "Creating release $tag."
+            gh release create $tag @assets --target $env:GITHUB_SHA --title "GLM Proxy $tag" --notes-file release-notes.md --latest
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }
+          Write-Host "Published $tag with $($assets.Count) assets."
+
+      - name: Upload installer as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: GLM-Proxy-Setup
+          path: installer/out/GLM-Proxy-Setup.exe
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload standalone executables as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: GLM-Proxy-Executables
+          path: |
+            installer/staging/zai-api.exe
+            installer/staging/token-collector.exe
+            installer/staging/glm-tray.exe
+          if-no-files-found: error
+          retention-days: 90
