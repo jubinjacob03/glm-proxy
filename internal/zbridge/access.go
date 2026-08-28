@@ -1,0 +1,115 @@
+package zbridge
+
+import (
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ============================================================================
+// ACCESS LOG
+// ============================================================================
+//
+// One line per request on the console, so a busy terminal stays readable. The
+// per-chunk and per-session detail behind each line is still recorded in the log
+// file at info or debug level.
+
+// accessRecord accumulates what the summary line reports. Handlers create one on
+// entry and call done exactly once, via defer, so every exit path is covered.
+type accessRecord struct {
+	started  time.Time
+	method   string
+	path     string
+	model    string
+	stream   bool
+	status   int
+	outcome  string // "" once finished normally, otherwise a short reason
+	bytesOut int64
+	chunks   int
+	reported bool
+}
+
+func newAccessRecord(method, path string) *accessRecord {
+	return &accessRecord{
+		started: time.Now(),
+		method:  method,
+		path:    path,
+		status:  200,
+	}
+}
+
+func (a *accessRecord) fail(status int, reason string) {
+	a.status = status
+	a.outcome = reason
+}
+
+// done emits the summary. Safe to call more than once; only the first wins.
+func (a *accessRecord) done() {
+	if a == nil || a.reported {
+		return
+	}
+	a.reported = true
+
+	var b strings.Builder
+	b.Grow(160)
+	b.WriteString(a.method)
+	b.WriteByte(' ')
+	b.WriteString(a.path)
+
+	if a.model != "" {
+		b.WriteString(" model=")
+		b.WriteString(a.model)
+	}
+	if a.stream {
+		b.WriteString(" stream")
+	}
+
+	b.WriteByte(' ')
+	b.WriteString(strconv.Itoa(a.status))
+
+	elapsed := time.Since(a.started)
+	b.WriteString(" in ")
+	b.WriteString(formatDuration(elapsed))
+
+	if a.chunks > 0 {
+		b.WriteString(" chunks=")
+		b.WriteString(strconv.Itoa(a.chunks))
+	}
+	if a.bytesOut > 0 {
+		b.WriteString(" out=")
+		b.WriteString(formatBytes(a.bytesOut))
+	}
+	if a.outcome != "" {
+		b.WriteString(" (")
+		b.WriteString(a.outcome)
+		b.WriteByte(')')
+	}
+
+	logConsolef("%s", b.String())
+}
+
+func formatDuration(d time.Duration) string {
+	switch {
+	case d < time.Millisecond:
+		return strconv.FormatInt(int64(d/time.Microsecond), 10) + "us"
+	case d < time.Second:
+		return strconv.FormatInt(int64(d/time.Millisecond), 10) + "ms"
+	default:
+		return strconv.FormatFloat(d.Seconds(), 'f', 1, 64) + "s"
+	}
+}
+
+func formatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return strconv.FormatInt(n, 10) + "B"
+	}
+	value := float64(n)
+	units := [...]string{"KB", "MB", "GB"}
+	idx := -1
+	for value >= unit && idx < len(units)-1 {
+		value /= unit
+		idx++
+	}
+	return strconv.FormatFloat(value, 'f', 1, 64) + units[idx]
+}

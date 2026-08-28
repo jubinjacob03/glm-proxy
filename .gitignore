@@ -1,0 +1,58 @@
+# go.mod and go.sum are deliberately NOT ignored. go.sum holds the
+# cryptographic checksums of every dependency; committing it is what makes
+# builds reproducible and lets `go mod verify` detect a tampered module. A repo
+# without it resolves different bytes on different machines.
+
+# Compiled binaries
+*.exe
+*.dll
+*.so
+*.dylib
+/zai-api
+/zai-bridge
+/token-collector
+/dist/
+/build/
+
+# Go test and profiling artifacts
+*.test
+*.out
+coverage.*
+__debug_bin*
+
+# Local environment — never commit real credentials
+.env
+.env.*
+!.env.example
+
+# Runtime artifacts (tokens.sqlite holds harvested device tokens)
+tokens.sqlite
+tokens.sqlite-shm
+tokens.sqlite-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+
+# Logs
+logs/
+*.log
+
+# Playwright / node
+node_modules/
+.playwright/
+ms-playwright/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Installer and packaging output
+installer/out/
+installer/staging/
+installer/*.ico

@@ -1,0 +1,17 @@
+.git
+.gitignore
+.assets
+image-gen
+installer
+cmd/glm-tray
+logs
+make.ps1
+*.exe
+*.log
+tokens.sqlite
+tokens.sqlite-shm
+tokens.sqlite-wal
+*.sqlite
+README.md
+
+# .env is NOT ignored: the image bakes it in at build time (see Dockerfile).

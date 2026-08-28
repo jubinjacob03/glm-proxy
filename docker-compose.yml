@@ -1,0 +1,60 @@
+name: glm-proxy
+
+services:
+  glm-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: glm-proxy:latest
+    container_name: glm-proxy
+
+    # unless-stopped is what keeps this running 24/7: the container comes back
+    # after a crash, after a host reboot, and when Docker Desktop starts. It
+    # stays down only if you explicitly stop it, and even then `docker start`
+    # or the next Docker Desktop launch will not silently resurrect it.
+    restart: unless-stopped
+
+    ports:
+      - "3007:3007"
+
+    # Configuration is baked into the image at build time. Anything set here
+    # overrides the baked value, which is the escape hatch for rotating a token
+    # without a rebuild.
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3007
+
+    volumes:
+      # Named volume so the harvested token store and the logs outlive the
+      # container. Delete it with `docker compose down -v` if you want a reset.
+      - glm-proxy-data:/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:3007/health >/dev/null || exit 1",
+        ]
+      interval: 30s
+      timeout: 5s
+      # Cold start includes a full token-collection run in a headless browser.
+      start_period: 300s
+      retries: 5
+
+    # Chromium needs more than the default 64MB of shared memory or it will
+    # crash mid-navigation.
+    shm_size: "1gb"
+
+    # Chromium's sandbox needs these; without them the browser fails to launch.
+    security_opt:
+      - seccomp=unconfined
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  glm-proxy-data:
+    name: glm-proxy-data
