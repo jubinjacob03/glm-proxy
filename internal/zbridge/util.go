@@ -470,3 +470,21 @@ func jsonMarshal(v interface{}) ([]byte, error) {
 	bufPool.Put(buf)
 	return result, nil
 }
+
+func isConnectivityTest(messages []Message) bool {
+	if len(messages) != 1 || messages[0].Role != "user" {
+		return false
+	}
+	var parts []struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(messages[0].Content, &parts) != nil || len(parts) == 0 {
+		return false
+	}
+	return parts[0].Type == "image_url"
+}
+
+func mustJSON(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}

@@ -128,7 +128,7 @@ func TestToolCallStreamShape(t *testing.T) {
 			"\n<<<END_TOOL_CALL>>>"
 		for _, ev := range []string{
 			`{"data":{"delta_content":"Let me read that file."}}`,
-			fmt.Sprintf(`{"data":{"delta_content":%s}}`, mustJSON(block)),
+			fmt.Sprintf(`{"data":{"delta_content":%s}}`, mustJSONStr(block)),
 			`{"data":{"phase":"done"}}`,
 		} {
 			fmt.Fprintf(w, "data: %s\n\n", ev)
@@ -253,7 +253,7 @@ func TestToolCallStreamShape(t *testing.T) {
 	}
 }
 
-func mustJSON(s string) string {
+func mustJSONStr(s string) string {
 	b, _ := json.Marshal(s)
 	return string(b)
 }

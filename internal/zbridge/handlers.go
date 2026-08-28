@@ -77,6 +77,44 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	access.stream = stream
 
+	if isConnectivityTest(messages) && len(body.Tools) == 0 {
+		access.status = 200
+		id := "chatcmpl-" + generateID()
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(200)
+			flusher, _ := w.(http.Flusher)
+			role := "assistant"
+			roleChunk := oaChunk{ID: id, Object: "chat.completion.chunk", Created: nowUnix(), Model: model, Choices: []oaChoice{{Index: 0, Delta: &oaDelta{Role: role}}}}
+			w.Write([]byte("data: " + mustJSON(roleChunk) + "\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			content := "Hello! GLM proxy is ready."
+			stop := "stop"
+			contentChunk := oaChunk{ID: id, Object: "chat.completion.chunk", Created: nowUnix(), Model: model, Choices: []oaChoice{{Index: 0, Delta: &oaDelta{Content: &content}, FinishReason: &stop}}}
+			w.Write([]byte("data: " + mustJSON(contentChunk) + "\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+			w.Write([]byte("data: [DONE]\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		} else {
+			stop := "stop"
+			resp := oaChunk{
+				ID: id, Object: "chat.completion", Created: nowUnix(), Model: model,
+				Choices: []oaChoice{{Index: 0, Message: &oaMessage{Role: "assistant", Content: "Hello! GLM proxy is ready."}, FinishReason: &stop}},
+				Usage:   &oaUsage{PromptTokens: 5, CompletionTokens: 6, TotalTokens: 11},
+			}
+			writeJSON(w, 200, resp)
+		}
+		return
+	}
+
 	// Every request runs on a throwaway chat that is deleted on Z.AI once the
 	// response is processed, so no server-side history outlives it.
 	chatID, pooled, err := AcquireStatelessSession(r.Context())

@@ -389,7 +389,7 @@ func sendToZAI(ctx context.Context, prompt string, opts SendOptions) (<-chan ZAI
 		err := sendToZAIStream(ctx, prompt, resolvedOpts, ch)
 		if err != nil {
 			if ctx.Err() != nil {
-				return // the consumer is gone; nobody is left to read this
+				return
 			}
 			select {
 			case ch <- ZAIResult{Err: err}:
