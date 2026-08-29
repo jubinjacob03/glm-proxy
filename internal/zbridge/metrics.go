@@ -9,12 +9,8 @@ import (
 	"time"
 )
 
-// ============================================================================
-// METRICS
-// ============================================================================
-
-// metricsState holds plain atomics so the request path pays nothing to record.
-// Exposed through /admin/stats, /health and /metrics.
+// metricsState is plain atomics, so recording costs the request path nothing.
+// Exposed via /admin/stats, /health and /metrics.
 type metricsState struct {
 	startedAt time.Time
 
@@ -42,7 +38,7 @@ type metricsState struct {
 
 	collectorRuns     atomic.Int64
 	collectorFailures atomic.Int64
-	collectorLastRun  atomic.Int64 // unix seconds, 0 = never
+	collectorLastRun  atomic.Int64 // unix seconds; 0 = never
 }
 
 var metrics = &metricsState{startedAt: time.Now()}
@@ -60,7 +56,7 @@ func (m *metricsState) avgUpstreamLatencyMs() float64 {
 	return float64(m.upstreamLatencyNs.Load()) / float64(n) / 1e6
 }
 
-// snapshot renders the current counters plus live subsystem state.
+// snapshot renders the counters plus live subsystem state.
 func (m *metricsState) snapshot() map[string]interface{} {
 	cacheDepth, cachePending := captchaCache.stats()
 	return map[string]interface{}{
@@ -102,9 +98,7 @@ func (m *metricsState) snapshot() map[string]interface{} {
 	}
 }
 
-// ============================================================================
-// /metrics — Prometheus text exposition
-// ============================================================================
+// Prometheus text exposition for /metrics.
 
 type promSample struct {
 	name  string

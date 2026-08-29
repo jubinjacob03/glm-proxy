@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -14,7 +15,7 @@ import (
 	"time"
 )
 
-// formatAnthropicError builds an Anthropic-style error envelope.
+// formatAnthropicError wraps a message in Anthropic's error envelope.
 func formatAnthropicError(errType, message string) interface{} {
 	return map[string]interface{}{
 		"type": "error",
@@ -25,8 +26,8 @@ func formatAnthropicError(errType, message string) interface{} {
 	}
 }
 
-// extractAnthropicContent coerces an Anthropic content field (string or
-// array of content blocks) into a plain string.
+// extractAnthropicContent coerces a content field (string or array of blocks)
+// into a plain string.
 func extractAnthropicContent(content interface{}) string {
 	if content == nil {
 		return ""
@@ -51,8 +52,8 @@ func extractAnthropicContent(content interface{}) string {
 	return string(b)
 }
 
-// anthropicToOpenAIRequest rewrites an Anthropic /v1/messages body into the
-// OpenAI shape the sendToZAI pipeline expects.
+// anthropicToOpenAIRequest rewrites a /v1/messages body into the OpenAI shape
+// the sendToZAI pipeline expects.
 func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
 	var req map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
@@ -100,7 +101,7 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
 			role, _ := mm["role"].(string)
 			content := mm["content"]
 
-			// tool_result blocks become separate OpenAI tool messages.
+			// tool_result blocks split out into separate tool messages.
 			if arr, ok := content.([]interface{}); ok {
 				hasToolResult := false
 				for _, item := range arr {
@@ -122,7 +123,7 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
 				}
 			}
 
-			// Assistant tool_use blocks become OpenAI tool_calls.
+			// Assistant tool_use blocks map onto tool_calls.
 			if role == "assistant" {
 				if arr, ok := content.([]interface{}); ok {
 					var textParts []string
@@ -167,13 +168,13 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
 
 			messages = append(messages, map[string]interface{}{
 				"role":    role,
-				"content": extractAnthropicContent(content),
+				"content": anthropicContentToOpenAI(content),
 			})
 		}
 	}
 	out["messages"] = messages
 
-	// Tools: input_schema becomes parameters, wrapped in a function object.
+	// input_schema becomes parameters, wrapped in a function object.
 	if tools, ok := req["tools"].([]interface{}); ok && len(tools) > 0 {
 		var openaiTools []map[string]interface{}
 		for _, t := range tools {
@@ -206,6 +207,83 @@ func anthropicToOpenAIRequest(bodyBytes []byte) ([]byte, error) {
 	}
 
 	return json.Marshal(out)
+}
+
+// anthropicContentToOpenAI flattens content to a plain string, except when it
+// carries image blocks: those become an OpenAI text/image_url parts array, the
+// one shape the rest of the pipeline (agent re-attach, vision routing, upload)
+// understands. Without it an attached image is silently discarded.
+func anthropicContentToOpenAI(content interface{}) interface{} {
+	arr, ok := content.([]interface{})
+	if !ok {
+		return extractAnthropicContent(content)
+	}
+
+	hasImage := false
+	for _, item := range arr {
+		if mp, ok := item.(map[string]interface{}); ok {
+			if t, _ := mp["type"].(string); t == "image" {
+				hasImage = true
+				break
+			}
+		}
+	}
+	if !hasImage {
+		return extractAnthropicContent(content)
+	}
+
+	parts := make([]map[string]interface{}, 0, len(arr))
+	for _, item := range arr {
+		mp, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch t, _ := mp["type"].(string); t {
+		case "text":
+			if txt, _ := mp["text"].(string); txt != "" {
+				parts = append(parts, map[string]interface{}{"type": "text", "text": txt})
+			}
+		case "image":
+			if p := anthropicImageToOpenAI(mp); p != nil {
+				parts = append(parts, p)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return extractAnthropicContent(content)
+	}
+	return parts
+}
+
+// anthropicImageToOpenAI converts one image block to an OpenAI image_url part,
+// or nil if malformed. base64 sources become data URLs, url sources pass through.
+func anthropicImageToOpenAI(block map[string]interface{}) map[string]interface{} {
+	src, ok := block["source"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	var imgURL string
+	switch t, _ := src["type"].(string); t {
+	case "base64":
+		data, _ := src["data"].(string)
+		if data == "" {
+			return nil
+		}
+		mediaType, _ := src["media_type"].(string)
+		if mediaType == "" {
+			mediaType = "image/png"
+		}
+		imgURL = "data:" + mediaType + ";base64," + data
+	case "url":
+		imgURL, _ = src["url"].(string)
+	}
+	if imgURL == "" {
+		return nil
+	}
+	return map[string]interface{}{
+		"type":      "image_url",
+		"image_url": map[string]interface{}{"url": imgURL},
+	}
 }
 
 func thinkingEnabled(thinkingCfg json.RawMessage) bool {
@@ -292,7 +370,16 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	stream := anthReq.Stream
 	access.stream = stream
 
-	// Throwaway chat session, deleted on Z.AI once the response is processed.
+	imageParts := extractImageParts(body.Messages)
+	if len(imageParts) > maxImagesPerRequest {
+		msg := fmt.Sprintf("too many images: %d provided, limit is %d per request",
+			len(imageParts), maxImagesPerRequest)
+		access.fail(400, msg)
+		writeJSON(w, 400, formatAnthropicError("invalid_request_error", msg))
+		return
+	}
+
+	// Throwaway chat, deleted upstream once the response is processed.
 	chatID, pooled, err := AcquireStatelessSession(r.Context())
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -319,8 +406,18 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	prompt := messagesToPrompt(messages)
 
+	upstreamModel := model
+	if len(imageParts) > 0 && !modelSupportsVision(model) {
+		if vm := resolveVisionModel(model); vm != "" {
+			logConsolef("[Vision] %s cannot accept images; routing this request to %s", printableASCII(model), vm)
+			upstreamModel = vm
+		} else {
+			logErrorf("[Vision] %s cannot accept images and no vision model is available", printableASCII(model))
+		}
+	}
+
 	opts := SendOptions{
-		Model:             model,
+		Model:             upstreamModel,
 		ChatID:            chatID,
 		ClientMessagesRaw: transformedMessages,
 		ReasoningEffort:   body.ReasoningEffort,
@@ -333,8 +430,8 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		opts.Thinking = &enabled
 	}
 
-	// Cancelling this tears down the upstream stream when the exchange is
-	// abandoned or fails, instead of running it to completion.
+	// Cancelling tears down the upstream stream when the exchange is abandoned or
+	// fails, instead of running it to completion.
 	upstreamCtx, cancelUpstream := context.WithCancel(r.Context())
 	defer cancelUpstream()
 
@@ -346,7 +443,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// anthropicStreamResponse converts a ZAIResult stream to Anthropic SSE events.
+// anthropicStreamResponse renders a ZAIResult stream as Anthropic SSE events.
 func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http.Request, prompt string, opts SendOptions, model, requestId string, access *accessRecord) {
 	metrics.requestsStreaming.Add(1)
 	metrics.activeStreams.Add(1)
@@ -459,9 +556,9 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 
 	toolCallEmitted := false
 
-	// A delta carrying an id starts a new tool_use block; an id-less delta only
-	// appends partial arguments JSON. The modern shim emits one complete call
-	// per delta, the legacy shim streams a header then argument fragments.
+	// A delta with an id starts a new tool_use block; an id-less one only appends
+	// partial arguments JSON. The modern shim emits one complete call per delta,
+	// the legacy shim a header then argument fragments.
 	emitToolCallEvent := func(tc map[string]interface{}) {
 		fn, _ := tc["function"].(map[string]interface{})
 		argsStr, _ := fn["arguments"].(string)
@@ -540,8 +637,8 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 		}
 
 		if result.FullText != "" && !strings.HasPrefix(result.FullText, fullContent) {
-			// A deep edit_content rewrite rewound text that was already
-			// forwarded: reset the stale agent interceptor (issue #23).
+			// A deep edit_content rewrite rewound already-forwarded text, so the
+			// interceptor's view is stale; reset it (issue #23).
 			if interceptor != nil {
 				interceptor = newAgentInterceptor()
 			}
@@ -559,7 +656,7 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 			fullContent = contentBuf.String()
 		}
 
-		// The parser emits the exact rune-safe delta to forward.
+		// The parser already emitted a rune-safe delta.
 		delta := result.Chunk
 		if delta == "" {
 			continue
@@ -576,8 +673,8 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 		}
 	}
 
-	// Drain the interceptor tail: trailing text plus any tool call whose
-	// block only completed at end of stream (modern shim hold-back window).
+	// Drain the interceptor tail: trailing text plus any call whose block only
+	// completed at end of stream (the modern shim's hold-back window).
 	if interceptor != nil {
 		rem, tailCalls := interceptor.finish()
 		if !toolCallEmitted {
@@ -587,7 +684,7 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 			emitToolCallEvent(tc)
 		}
 
-		// Safety net: fallback tool call extraction at stream end
+		// Safety net: re-scan the whole text at stream end.
 		if !toolCallEmitted {
 			for _, tc := range agentExtractToolCalls(fullContent) {
 				emitToolCallEvent(tc)
@@ -619,7 +716,7 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 	writeEvent("message_stop", map[string]interface{}{"type": "message_stop"})
 }
 
-// anthropicNonStreamResponse produces a single Anthropic message object.
+// anthropicNonStreamResponse collapses the stream into one message object.
 func anthropicNonStreamResponse(ctx context.Context, w http.ResponseWriter, prompt string, opts SendOptions, model, requestId string, access *accessRecord) {
 	ch, err := sendToZAI(ctx, prompt, opts)
 	if err != nil {

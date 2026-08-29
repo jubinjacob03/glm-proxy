@@ -1,5 +1,4 @@
-// agent_test.go
-// Tests for the modern agent-mode shim in agent.go, plus the dispatch glue.
+// Tests for the modern agent-mode shim, plus the dispatch glue.
 
 package zbridge
 
@@ -31,7 +30,7 @@ func TestFindAgentMarkerVariants(t *testing.T) {
 			t.Errorf("findAgentMarker(%q) = (%d,%d), want (%d,%d)", c.in, at, ln, c.wantAt, c.wantLn)
 		}
 	}
-	// The TOOL_CALL inside an END marker must never be taken as a start.
+	// The TOOL_CALL inside an END marker is not a start marker.
 	if at, _ := findAgentMarker(agentToolEnd, agentStartWord, true); at != -1 {
 		t.Errorf("END marker matched as start at %d", at)
 	}
@@ -42,9 +41,8 @@ func TestFindAgentMarkerVariants(t *testing.T) {
 		t.Errorf("agentWorstMarkerLen = %d, want %d", got, len("<<<<TOOL_CALL>>>>"))
 	}
 
-	// Streaming mode: a trailing '>' run touching the end of the data must
-	// wait instead of matching short — this keeps the third '>' of a
-	// canonical marker from leaking when chunks split the marker.
+	// Streaming: a '>' run touching the end must wait rather than match short,
+	// which is what stops a canonical marker's third '>' leaking when chunks split.
 	for _, tc := range []struct{ in, word string }{
 		{"a <<<TOOL_CALL>>", agentStartWord},
 		{"x <<<END_TOOL_CALL>>", agentEndWord},
@@ -58,10 +56,10 @@ func TestFindAgentMarkerVariants(t *testing.T) {
 	}
 }
 
-// ── finished-text parsing ────────────────────────────────────────────────────
+// Finished-text parsing.
 
-// The exact RESPONSE payload reconstructed from the failing debug session
-// (deepseek-v4-pro, "Find my public ip").
+// Reconstructed byte for byte from the failing debug session (deepseek-v4-pro,
+// "Find my public ip").
 const malformedPayload = "<<TOOL_CALL>>>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"curl -s https://api.ipify.org\"}}\n<<<END_TOOL_CALL>>>"
 
 func TestParseAgentToolCallsTolerantMarkers(t *testing.T) {
@@ -101,15 +99,12 @@ func TestNormalizeAgentFencesTolerantMarkers(t *testing.T) {
 	}
 }
 
-// ── payload tolerance ────────────────────────────────────────────────────────
-//
-// Second live failure mode: the markers were canonical, but the model invented
-// a FLAT payload shape — {"tool": "bash", "command": ..., "timeout": 10}
-// instead of {"name": ..., "arguments": {...}}. A strict parser accepts the
-// JSON with Name == "" and the whole block leaks to the client as plain
-// content with finish_reason "stop", so the tool is never executed.
+// Payload tolerance. The second live failure: canonical markers, but a flat
+// payload — {"tool":"bash","command":...} instead of {"name":...,"arguments":{}}.
+// A strict parser accepts that with Name == "", so the block leaks as content with
+// finish_reason "stop" and the tool never runs.
 
-// The exact RESPONSE text reconstructed from the failing debug session.
+// Text again from the real session.
 const flatPayload = `<<<TOOL_CALL>>>{"tool": "bash", "command": "curl -s ifconfig.me", "timeout": 10}<<<END_TOOL_CALL>>>`
 
 func TestParseAgentToolCallsFlatPayload(t *testing.T) {
@@ -136,19 +131,19 @@ func TestParseAgentToolCallsPayloadVariants(t *testing.T) {
 		wantName string
 		wantArgs string // substring the arguments JSON must contain
 	}{
-		// canonical shape keeps working
+		// The canonical shape keeps working.
 		{`{"name":"bash","arguments":{"command":"id"}}`, "bash", `"command":"id"`},
-		// alternate explicit-arguments spellings
+		// Alternate spellings of an explicit arguments key.
 		{`{"name":"bash","parameters":{"command":"id"}}`, "bash", `"command":"id"`},
 		{`{"tool":"bash","arguments":{"command":"id"}}`, "bash", `"command":"id"`},
-		// alternate name keys with flat parameters
+		// Alternate name keys, parameters left flat.
 		{`{"tool_name":"read","path":"/etc/hosts"}`, "read", `"/etc/hosts"`},
 		{`{"function":"bash","command":"uname"}`, "bash", `"uname"`},
-		// flat payload keyed on "name"
+		// Flat payload keyed on "name".
 		{`{"name":"bash","command":"pwd","timeout":5}`, "bash", `"command":"pwd"`},
-		// a tool parameter literally named "name" must not shadow the tool key
+		// A parameter literally called "name" must not shadow the tool key.
 		{`{"tool":"write","name":"a.txt","content":"x"}`, "write", `"content":"x"`},
-		// no parameters at all
+		// No parameters at all.
 		{`{"tool":"bash"}`, "bash", `{}`},
 	}
 	for _, c := range cases {
@@ -166,15 +161,14 @@ func TestParseAgentToolCallsPayloadVariants(t *testing.T) {
 			t.Errorf("body %s => arguments %s, want substring %s", c.body, args, c.wantArgs)
 		}
 	}
-	// No recognizable tool name at all: stays visible text (existing policy).
+	// No recognisable tool name: stays visible text, by policy.
 	if calls := ParseAgentToolCalls(`<<<TOOL_CALL>>>{"command":"ls"}<<<END_TOOL_CALL>>>`); len(calls) != 0 {
 		t.Errorf("nameless payload produced %d calls, want 0", len(calls))
 	}
 }
 
-// goalFragmentChunks are the upstream SSE fragment appends of the failing
-// session, byte for byte (initial RESPONSE fragment content "<<", then every
-// APPEND/"v" delta from the debug log).
+// goalFragmentChunks are that session's SSE appends byte for byte: the initial
+// "<<" fragment, then every delta from the debug log.
 var goalFragmentChunks = []string{
 	"<<", "<", "TO", "OL", "_C", "ALL", ">>>",
 	"{\"", "tool", "\":", " \"", "bash", "\",", " \"", "command", "\":",
@@ -198,8 +192,8 @@ func TestStreamInterceptorReplaysFlatPayloadDebugStream(t *testing.T) {
 	}
 }
 
-// The prompt must pin the payload schema: the bare "{JSON}" placeholder is
-// what let the model invent the flat shape in the first place.
+// The prompt must pin the schema: a bare "{JSON}" placeholder is what let the
+// model invent the flat shape to begin with.
 func TestAgentPromptPinsPayloadSchema(t *testing.T) {
 	prompt := buildAgentPrompt(
 		[]agentMessage{{Role: "user", Content: []byte(`"Find my public ip"`)}},
@@ -220,10 +214,9 @@ func TestAgentPromptPinsPayloadSchema(t *testing.T) {
 	}
 }
 
-// ── streaming interceptor ────────────────────────────────────────────────────
+// The streaming interceptor.
 
-// Replays the RESPONSE fragment chunks exactly as they arrived in the failing
-// session's upstream SSE log, byte for byte.
+// Replays the fragments exactly as they arrived in that session's SSE log.
 var debugFragmentChunks = []string{
 	"<<", "<", "TO", "OL", "_C", "ALL", ">>", ">\n",
 	"{\"", "name", "\":\"", "bash", "\",\"",
@@ -287,7 +280,7 @@ func TestStreamInterceptorShortTailVariant(t *testing.T) {
 	}
 }
 
-// An unterminated opening marker must not hang the stream nor be parsed.
+// An unterminated opener must neither hang the stream nor be parsed.
 func TestStreamInterceptorUnterminatedMarkerStaysContent(t *testing.T) {
 	in := &AgentStreamInterceptor{}
 	parsed := in.Feed("<TOOL_CALL> just talking about tools")
@@ -301,7 +294,7 @@ func TestStreamInterceptorUnterminatedMarkerStaysContent(t *testing.T) {
 	}
 }
 
-// Invalid JSON inside a recognized block stays visible text (existing policy).
+// Invalid JSON inside a recognised block stays visible text, by policy.
 func TestStreamInvalidBlockLeaksAsContent(t *testing.T) {
 	content, calls, _ := feedChunks(t, splitRunes("<<TOOL_CALL>>>\nnot json\n<<<END_TOOL_CALL>>>", 4), 1)
 	if calls != 0 {
@@ -338,7 +331,7 @@ func TestStreamTwoSequentialBlocks(t *testing.T) {
 	}
 }
 
-// splitRunes cuts s into pieces of n bytes (ASCII input assumed).
+// splitRunes cuts s into n-byte pieces, assuming ASCII input.
 func splitRunes(s string, n int) []string {
 	var out []string
 	for i := 0; i < len(s); i += n {
@@ -351,7 +344,7 @@ func splitRunes(s string, n int) []string {
 	return out
 }
 
-// ── fence helpers ────────────────────────────────────────────────────────────
+// Fence helpers.
 
 func TestTrimTrailingAgentFence(t *testing.T) {
 	cases := []struct{ in, want string }{
@@ -422,14 +415,11 @@ func TestNonStreamParseStripWithFences(t *testing.T) {
 	}
 }
 
-// ── prompt structure (context rot) ───────────────────────────────────────────
+// Prompt structure, i.e. context rot.
 
-// TestContextRotHypothesis tests whether the agent mode properly handles
-// tool results when reasoning/thinking is enabled.
-//
-// The new prompt structure uses XML-like section tags (<tool_result>,
-// <tool_exchange>, <current_task>) instead of [ROLE: ...] tags, which
-// eliminates marker ambiguity and gives the model clear structure.
+// TestContextRotHypothesis checks agent mode handles tool results when thinking is
+// enabled. The XML-like section tags (<tool_result>, <tool_exchange>,
+// <current_task>) replace [ROLE: ...], removing marker ambiguity.
 func TestContextRotHypothesis(t *testing.T) {
 	messages := []agentMessage{
 		{
@@ -485,22 +475,22 @@ func TestContextRotHypothesis(t *testing.T) {
 
 	prompt := buildAgentPrompt(messages, tools)
 
-	// Check that tool results use the new <tool_result> XML tag
+	// Tool results carry the <tool_result> tag.
 	if !strings.Contains(prompt, "<tool_result") {
 		t.Error("Prompt should contain <tool_result> tag")
 	}
 
-	// Check that call_id is present in the tool_result tag
+	// The tag carries call_id.
 	if !strings.Contains(prompt, `call_id="call_123"`) {
 		t.Error("Prompt should contain call_id attribute in tool_result")
 	}
 
-	// Check that assistant's tool call is rendered
+	// The assistant's call is rendered.
 	if !strings.Contains(prompt, "<<<TOOL_CALL>>>") {
 		t.Error("Prompt should contain <<<TOOL_CALL>>> from assistant message")
 	}
 
-	// Check that the current_task section contains the last user message
+	// current_task holds the last user message.
 	if !strings.Contains(prompt, "<current_task>") {
 		t.Error("Prompt should have <current_task> section")
 	}
@@ -508,18 +498,18 @@ func TestContextRotHypothesis(t *testing.T) {
 		t.Error("Prompt should contain the final user message in <current_task>")
 	}
 
-	// The key improvement: tool results are in <tool_result> tags, clearly
-	// separated from assistant messages in <tool_exchange> blocks
+	// The point of the change: results sit in <tool_result>, clearly separated
+	// from assistant messages inside <tool_exchange>.
 	if !strings.Contains(prompt, "<tool_exchange>") {
 		t.Error("Prompt should group tool calls with results in <tool_exchange>")
 	}
 
-	// Check that the tool result content is visible in the prompt
+	// The result content itself reaches the prompt.
 	if !strings.Contains(prompt, "110.226.238.87") {
 		t.Error("Prompt should contain the tool result content (IP address)")
 	}
 
-	// Verify the new structure: no [ROLE: ...] tags
+	// And no [ROLE: ...] tags survive.
 	roleMarkers := []string{"[ROLE: system]", "[ROLE: user]", "[ROLE: assistant]"}
 	for _, marker := range roleMarkers {
 		if strings.Contains(prompt, marker) {
@@ -898,10 +888,9 @@ func TestHistorySummarization(t *testing.T) {
 	}
 }
 
-// ── GLM-Free-API integration: variant dispatch ───────────────────────────────
+// Variant dispatch across both shims.
 
-// withAgentVariant swaps the configured agent variant for the duration of a
-// test and restores it afterwards.
+// withAgentVariant swaps the configured variant for one test, then restores it.
 func withAgentVariant(t *testing.T, variant string) {
 	t.Helper()
 	prevMode, prevVariant := config.AgentMode, config.AgentModeVariant
@@ -1006,7 +995,7 @@ func TestAgentTransformMessagesModern(t *testing.T) {
 			t.Errorf("modern prompt missing %q", want)
 		}
 	}
-	// Legacy markers must not leak into the modern prompt.
+	// No legacy markers may leak into the modern prompt.
 	if strings.Contains(prompt, "[ROLE:") {
 		t.Error("modern prompt contains legacy [ROLE:] markers")
 	}
@@ -1030,7 +1019,7 @@ func TestAgentTransformMessagesLegacyStillWorks(t *testing.T) {
 	if err := json.Unmarshal(raw, &msgs); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	// Legacy: system prefix message + rewritten system + user + tool contract.
+	// Legacy: prefix message, rewritten system, user, then the contract.
 	if len(msgs) != 4 {
 		t.Fatalf("legacy transform produced %d messages, want 4", len(msgs))
 	}
@@ -1053,15 +1042,14 @@ func TestAgentTransformMessagesLegacyStillWorks(t *testing.T) {
 	}
 }
 
-// TestAgentInterceptorAdapters verifies both interceptor adapters behave
-// correctly through the shared agentInterceptor interface.
+// TestAgentInterceptorAdapters drives both adapters through the shared
+// agentInterceptor interface.
 func TestAgentInterceptorAdapters(t *testing.T) {
 	stream := "Sure thing.\n<<<TOOL_CALL>>>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"id\"}}\n<<<END_TOOL_CALL>>>"
 
-	// countCalls counts logical tool calls: deltas carrying an id start a
-	// new call (the legacy adapter additionally streams id-less argument
-	// fragments for the same call; the modern adapter emits one complete
-	// delta per call).
+	// countCalls counts logical calls: a delta with an id starts one. The legacy
+	// adapter also streams id-less argument fragments for the same call, while
+	// the modern one emits a single complete delta.
 	run := func(in agentInterceptor) (content string, calls int, argFrags int) {
 		for i := 0; i < len(stream); i += 4 {
 			end := i + 4
@@ -1090,7 +1078,7 @@ func TestAgentInterceptorAdapters(t *testing.T) {
 		return
 	}
 
-	// Modern adapter: one complete call, no marker leakage.
+	// Modern adapter: one complete call, and no marker leaks.
 	content, calls, argFrags := run(&modernAgentInterceptor{in: &AgentStreamInterceptor{}})
 	if calls != 1 {
 		t.Errorf("modern adapter: %d calls, want 1", calls)
@@ -1105,8 +1093,8 @@ func TestAgentInterceptorAdapters(t *testing.T) {
 		t.Errorf("modern adapter damaged prose: %q", content)
 	}
 
-	// Legacy adapter: same input (canonical markers) also yields one call,
-	// streamed incrementally (header delta + argument fragments).
+	// Legacy adapter: the same canonical input yields one call too, streamed as a
+	// header delta plus argument fragments.
 	content, calls, _ = run(&legacyAgentInterceptor{in: newAgentStreamInterceptor()})
 	if calls != 1 {
 		t.Errorf("legacy adapter: %d calls, want 1", calls)
@@ -1116,11 +1104,11 @@ func TestAgentInterceptorAdapters(t *testing.T) {
 	}
 }
 
-// TestAgentExtractStripDispatch checks the extract/strip dispatch helpers
-// route to the right implementation per variant.
+// TestAgentExtractStripDispatch checks the dispatch helpers route to the right
+// implementation per variant.
 func TestAgentExtractStripDispatch(t *testing.T) {
-	// Flat payload: the MODERN tolerant parser resolves the tool name and
-	// folds the stray keys into arguments.
+	// The modern tolerant parser resolves the name and folds stray keys into
+	// arguments.
 	withAgentVariant(t, "modern")
 	calls := agentExtractToolCalls(flatPayload)
 	if len(calls) != 1 {
@@ -1134,9 +1122,8 @@ func TestAgentExtractStripDispatch(t *testing.T) {
 	}
 
 	withAgentVariant(t, "legacy")
-	// The legacy strict parser accepts the flat JSON but cannot resolve a
-	// tool name from it (name stays "") — exactly the failure mode the
-	// modern tolerant parser fixes.
+	// The legacy strict parser accepts the JSON but resolves no name, leaving it
+	// "" — exactly the failure the tolerant parser fixes.
 	legacyCalls := agentExtractToolCalls(flatPayload)
 	for _, tc := range legacyCalls {
 		fn, _ := tc["function"].(map[string]interface{})
@@ -1144,7 +1131,7 @@ func TestAgentExtractStripDispatch(t *testing.T) {
 			t.Errorf("legacy extract unexpectedly resolved name %q from flat payload", name)
 		}
 	}
-	// Canonical payload works on legacy too.
+	// A canonical payload works on legacy as well.
 	canonical := "<<<TOOL_CALL>>>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"id\"}}\n<<<END_TOOL_CALL>>>"
 	if calls := agentExtractToolCalls(canonical); len(calls) != 1 {
 		t.Errorf("legacy extract: %d calls for canonical payload, want 1", len(calls))

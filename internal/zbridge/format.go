@@ -1,9 +1,5 @@
 package zbridge
 
-// ============================================================================
-// OPENAI RESPONSE FORMATTING
-// ============================================================================
-
 func formatOpenAIResponse(result ResponseResult, model, requestId string, stream bool) interface{} {
 	rawContent := result.Content
 	if rawContent == "" {
@@ -44,8 +40,8 @@ func formatOpenAIResponse(result ResponseResult, model, requestId string, stream
 	}
 }
 
-// formatOpenAIToolCallResponse renders a non-streaming completion whose reply
-// is a tool invocation rather than text.
+// formatOpenAIToolCallResponse is the non-stream reply when the model invoked a
+// tool instead of answering.
 func formatOpenAIToolCallResponse(model, requestId, content, reasoning, prompt string, toolCalls []map[string]interface{}) interface{} {
 	promptTokens := estimateTokens(prompt)
 	completionTokens := estimateTokens(content)

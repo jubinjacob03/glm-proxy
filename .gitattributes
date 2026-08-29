@@ -1,0 +1,25 @@
+* text=auto eol=lf
+
+*.go     text eol=lf diff=golang
+*.md     text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.json   text eol=lf
+*.nsi    text eol=lf
+*.nsh    text eol=lf
+*.ps1    text eol=lf
+*.sh     text eol=lf
+*.svg    text eol=lf
+*.txt    text eol=lf
+Dockerfile text eol=lf
+LICENSE    text eol=lf
+
+*.exe    binary
+*.dll    binary
+*.ico    binary
+*.png    binary
+*.jpg    binary
+*.gif    binary
+*.webp   binary
+*.sqlite binary
+*.db     binary

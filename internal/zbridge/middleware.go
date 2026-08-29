@@ -13,10 +13,6 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
-// ============================================================================
-// MIDDLEWARE
-// ============================================================================
-
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -39,13 +35,17 @@ func checkAuth(r *http.Request) bool {
 	if len(authHeader) >= 7 && strings.EqualFold(authHeader[:7], "Bearer ") {
 		provided = authHeader[7:]
 	}
-	// Anthropic clients send the key via x-api-key instead.
+	// Anthropic clients send the key as x-api-key.
 	if provided == "" {
 		provided = r.Header.Get("x-api-key")
 	}
-	// Constant-time: == returns at the first differing byte, leaking the
-	// length of the matching prefix through response timing.
-	return subtle.ConstantTimeCompare([]byte(provided), []byte(config.Auth.Token)) == 1
+	// Constant-time and no early return, so neither the matching prefix length nor
+	// which key matched leaks through response timing.
+	match := 0
+	for _, tok := range config.Auth.Tokens {
+		match |= subtle.ConstantTimeCompare([]byte(provided), []byte(tok))
+	}
+	return match == 1
 }
 
 func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -70,10 +70,6 @@ func authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// ============================================================================
-// HTTP HANDLERS
-// ============================================================================
-
 func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -86,22 +82,29 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	var userIDPreview interface{}
-	if session.UserID != "" {
-		uid := session.UserID
-		if len(uid) > 8 {
-			uid = uid[:8]
-		}
-		userIDPreview = uid + "..."
-	}
-
-	writeJSON(w, 200, map[string]interface{}{
+	body := map[string]interface{}{
 		"connected":   session.Initialized,
-		"userName":    session.UserName,
-		"userId":      userIDPreview,
-		"feVersion":   session.FeVersion,
-		"features":    session.Features,
 		"mode":        "direct",
 		"sessionPool": sessionPoolStatus(),
-	})
+	}
+
+	// Identity only for an authenticated caller. This route stays open so probes and
+	// the dashboard work, and on a 0.0.0.0 bind that would otherwise name the Z.AI
+	// account to anyone who can reach the port.
+	if checkAuth(r) {
+		var userIDPreview interface{}
+		if session.UserID != "" {
+			uid := session.UserID
+			if len(uid) > 8 {
+				uid = uid[:8]
+			}
+			userIDPreview = uid + "..."
+		}
+		body["userName"] = session.UserName
+		body["userId"] = userIDPreview
+		body["feVersion"] = session.FeVersion
+		body["features"] = session.Features
+	}
+
+	writeJSON(w, 200, body)
 }

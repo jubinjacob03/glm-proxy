@@ -1,17 +1,15 @@
-// Exported seams for the blackbox integration tests in tests/, and for
-// operational scripting. They expose just enough live state to point the bridge
-// at a mock upstream and bypass the captcha machinery.
+// Exported seams for the blackbox tests in tests/: just enough live state to
+// point the bridge at a mock upstream and skip the captcha machinery.
 
 package zbridge
 
 import "time"
 
-// GetConfig returns the live configuration. Callers may toggle fields and
-// should restore whatever they change.
+// GetConfig returns the live config; callers must restore whatever they change.
 func GetConfig() *Config { return config }
 
-// OverrideSessionState swaps the session identity and returns a function that
-// restores the previous one, so tests can skip guest auth.
+// OverrideSessionState swaps the session identity so tests can skip guest auth,
+// returning a restore func.
 func OverrideSessionState(token, userID string, initialized bool) func() {
 	session.mu.Lock()
 	oldToken, oldUser, oldInit := session.Token, session.UserID, session.Initialized
@@ -24,9 +22,8 @@ func OverrideSessionState(token, userID string, initialized bool) func() {
 	}
 }
 
-// SeedCaptchaParam pushes a ready-made captcha_verify_param into the agent-mode
-// cache, so requests bypass the Aliyun handshake. Tests only; the live cache is
-// fed by captchaCache.Run.
+// SeedCaptchaParam pushes a ready-made param into the agent-mode cache so
+// requests skip the Aliyun handshake. Tests only; live, captchaCache.Run fills it.
 func SeedCaptchaParam(value string) {
 	captchaCache.mu.Lock()
 	captchaCache.params = append(captchaCache.params, cachedCaptcha{

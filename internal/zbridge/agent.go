@@ -1,21 +1,16 @@
-// agent.go
-// Agent mode (modern): an XML-sectioned prompt shim for Z.AI compatibility.
+// Agent mode (modern): an XML-sectioned prompt shim.
 //
 // Z.AI's completions endpoint accepts neither non-user roles nor OpenAI tool
-// definitions, so agent mode rewrites the conversation into a single structured
-// prompt and converts the model's textual tool-call protocol back into OpenAI
-// tool_calls on the way out. No native tool calling is involved.
+// definitions, so the conversation is folded into one structured prompt and the
+// model's textual tool-call protocol is converted back into OpenAI tool_calls on
+// the way out. No native tool calling is involved.
 //
-// The prompt uses explicit section tags (<system>, <tools>, <history_summary>,
-// <recent>, <current_task>, <output_rules>), summarises older tool exchanges,
-// anchors the latest user message as the current task, and repeats the output
-// contract last to exploit recency bias. Parsing is deliberately tolerant:
-// markers match with 2..4 angle brackets per side, adjacent ```json fences are
-// stripped, several payload shapes are accepted, and the streaming interceptor
-// holds back a trailing window so a marker split across upstream chunks cannot
-// leak as content.
+// Parsing is deliberately tolerant, because models are sloppy: markers match
+// with 2..4 angle brackets per side, adjacent ```json fences are stripped,
+// several payload shapes are accepted, and the streaming interceptor holds back
+// a trailing window so a marker split across chunks cannot leak as content.
 //
-// The legacy [ROLE: ...] shim remains available via AGENT_MODE_VARIANT=legacy.
+// The legacy [ROLE: ...] shim is still available via AGENT_MODE_VARIANT=legacy.
 
 package zbridge
 
@@ -33,11 +28,10 @@ import (
 const agentToolStart = "<<<TOOL_CALL>>>"
 const agentToolEnd = "<<<END_TOOL_CALL>>>"
 
-// Models sometimes miscount the angle brackets framing a marker, e.g. emitting
-// "<<TOOL_CALL>>>" alongside a well-formed "<<<END_TOOL_CALL>>>". An exact
-// matcher misses those blocks and the whole tool call leaks to the client as
-// plain content, so both markers accept a bracket run of 2..4 per side.
-// Emission stays canonical.
+// Models miscount the angle brackets, e.g. "<<TOOL_CALL>>>" next to a correct
+// "<<<END_TOOL_CALL>>>". An exact matcher misses those and the whole call leaks
+// as plain content, so both markers accept 2..4 brackets per side. Emission
+// stays canonical.
 const (
 	agentStartWord   = "TOOL_CALL"
 	agentEndWord     = "END_TOOL_CALL"
@@ -72,15 +66,12 @@ const (
 	markerIncomplete = -2 // a candidate needs more bytes before it can match
 )
 
-// findAgentMarker locates the first occurrence of word framed by 2..4 '<' before
-// and 2..4 '>' after, returning the index of the first bracket and the full
-// marker length, or markerNone / markerIncomplete. Occurrences that are not so
-// framed (the TOOL_CALL inside an END marker, prose, code) are skipped.
+// findAgentMarker locates word framed by 2..4 '<' and 2..4 '>', returning the
+// first bracket's index and the marker length, or markerNone/markerIncomplete.
+// Unframed occurrences (the TOOL_CALL inside an END marker, prose, code) skip.
 //
-// A trailing '>' run reaching the end of s has no terminating byte yet and may
-// still grow, so with final=false it reports markerIncomplete rather than
-// matching short, which would leak the missing brackets as content. With
-// final=true the run is taken as is.
+// A '>' run touching the end of s may still grow, so with final=false it reports
+// markerIncomplete rather than matching short and leaking the missing brackets.
 func findAgentMarker(s, word string, final bool) (int, int) {
 	for from := 0; ; {
 		j := strings.Index(s[from:], word)
@@ -97,10 +88,10 @@ func findAgentMarker(s, word string, final bool) (int, int) {
 		trail := bracketRunForward(after, '>')
 		switch {
 		case trail > agentMaxBrackets:
-			// Definitively over-long; more bytes cannot shrink the run.
+			// Over-long for good: more bytes cannot shrink the run.
 		case trail == len(after) && !final:
-			// The run touches the end of the available data and may still grow
-			// past min/max, so wait for a terminating byte.
+			// Touches the end of the data and may still grow past max, so wait
+			// for a terminating byte.
 			return markerIncomplete, 0
 		case trail >= agentMinBrackets:
 			return w - lead, lead + len(word) + trail
@@ -109,14 +100,13 @@ func findAgentMarker(s, word string, final bool) (int, int) {
 	}
 }
 
-// agentSpan marks one complete tool-call block in finished text:
-// [start,end) covers both markers, [bodyStart,bodyEnd) the JSON between them.
+// agentSpan marks one complete block: [start,end) covers both markers,
+// [bodyStart,bodyEnd) the JSON between them.
 type agentSpan struct {
 	start, bodyStart, bodyEnd, end int
 }
 
-// findAgentSpans walks every complete tool-call block in text. An unterminated
-// opening marker is ignored.
+// findAgentSpans walks every complete block; an unterminated opener is ignored.
 func findAgentSpans(text string) []agentSpan {
 	var spans []agentSpan
 	for pos := 0; ; {
@@ -139,9 +129,8 @@ func findAgentSpans(text string) []agentSpan {
 	}
 }
 
-// ============================================================================
-// PROMPT ARCHITECTURE
-// ============================================================================
+// Prompt section order, exploiting recency bias — the contract appears first and
+// last, and the current task sits near the end:
 //
 //	<system>       compact output contract
 //	<tools>        available tool definitions
@@ -150,9 +139,9 @@ func findAgentSpans(text string) []agentSpan {
 //	<current_task> the latest user message, as a recency anchor
 //	<output_rules> final reminder, carrying the heaviest weight
 
-// agentCallSchema is stated verbatim in the prompt and repeated in the final
-// reminder. A bare "{JSON}" placeholder let models invent flat payloads such as
-// {"tool":"bash","command":...} that cannot be mapped back to tool_calls.
+// agentCallSchema appears verbatim in the prompt and again in the final reminder.
+// A bare "{JSON}" placeholder let models invent flat payloads like
+// {"tool":"bash","command":...} that cannot map back to tool_calls.
 const agentCallSchema = `{"name":"<tool_name>","arguments":{<parameter JSON>}}`
 
 const agentSystemPrefix = "<system>\n" +
@@ -171,8 +160,8 @@ const agentSystemPrefix = "<system>\n" +
 	"- Never call a tool not listed in <tools>.\n" +
 	"</system>"
 
-// agentFinalReminder closes the prompt. Models weight the end most heavily, so
-// the output contract is repeated as the last thing they see.
+// agentFinalReminder closes the prompt: models weight the end most heavily, so
+// the contract is the last thing they see.
 const agentFinalReminder = `<output_rules>
 RESPOND WITH EXACTLY ONE OF:
 1. <<<TOOL_CALL>>>{"name":"<tool_name>","arguments":{...}}<<<END_TOOL_CALL>>> (no fences, no other text)
@@ -180,14 +169,9 @@ RESPOND WITH EXACTLY ONE OF:
 The tool-call JSON uses EXACTLY the keys "name" and "arguments" — never a "tool" key, never bare top-level parameters.
 </output_rules>`
 
-// ============================================================================
-// OPENAI WIRE TYPES
-// ============================================================================
-
 // agentMessage is one incoming OpenAI-style message. Content stays raw so both
-// strings and typed-part arrays are accepted. Unlike the minimal Message type
-// used for the Z.AI wire, it carries the tool fields needed to replay prior
-// exchanges in the prompt.
+// strings and typed-part arrays are accepted, and unlike the minimal Message
+// type it carries the tool fields needed to replay prior exchanges.
 type agentMessage struct {
 	Role       string              `json:"role"`
 	Content    json.RawMessage     `json:"content"`
@@ -196,8 +180,8 @@ type agentMessage struct {
 	Name       string              `json:"name,omitempty"`
 }
 
-// openAITool is one entry of the OpenAI tools array. Both the nested form
-// ({type:"function",function:{...}}) and flat definitions are accepted.
+// openAITool is one tools-array entry. Both the nested
+// {type:"function",function:{...}} form and flat definitions are accepted.
 type openAITool struct {
 	Type       string          `json:"type"`
 	Function   *openAIFnSpec   `json:"function,omitempty"`
@@ -233,8 +217,8 @@ func (t *openAITool) fnParameters() json.RawMessage {
 	return t.Parameters
 }
 
-// assistantToolCall is a tool call inside an assistant message of the
-// incoming request (the client replaying previous calls).
+// assistantToolCall is a call inside an incoming assistant message, i.e. the
+// client replaying earlier calls.
 type assistantToolCall struct {
 	ID       string `json:"id"`
 	Type     string `json:"type"`
@@ -243,10 +227,6 @@ type assistantToolCall struct {
 		Arguments json.RawMessage `json:"arguments"` // JSON-encoded string per spec
 	} `json:"function"`
 }
-
-// ============================================================================
-// PROMPT BUILDING
-// ============================================================================
 
 // contentToText flattens OpenAI message content (string or typed parts) to text.
 func contentToText(raw json.RawMessage) string {
@@ -282,7 +262,7 @@ func jsonIndent(raw json.RawMessage) string {
 	return buf.String()
 }
 
-// renderAgentTools renders the OpenAI tools array as the [TOOL CONTRACT] block.
+// renderAgentTools renders the tools array as the [TOOL CONTRACT] block.
 func renderAgentTools(tools []openAITool) string {
 	if len(tools) == 0 {
 		return "(no tools provided)"
@@ -305,15 +285,15 @@ func renderAgentTools(tools []openAITool) string {
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
-// agentCallPayload is the JSON object emitted inside a tool-call block.
-// A struct (not a map) keeps the documented name-first key order.
+// agentCallPayload is what goes inside a tool-call block. A struct, not a map, so
+// the documented name-first key order survives.
 type agentCallPayload struct {
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
 }
 
-// renderToolCallBlock renders one assistant tool-call block in the wire protocol
-// format, used both in prompt history and in response parsing.
+// renderToolCallBlock emits one block in wire format, used for prompt history and
+// for response parsing alike.
 func renderToolCallBlock(call assistantToolCall) string {
 	payload, err := json.Marshal(agentCallPayload{
 		Name:      call.Function.Name,
@@ -325,8 +305,7 @@ func renderToolCallBlock(call assistantToolCall) string {
 	return fmt.Sprintf("%s\n%s\n%s", agentToolStart, payload, agentToolEnd)
 }
 
-// renderAssistantTurn renders an assistant message with optional text and tool
-// calls inside an XML-like tag.
+// renderAssistantTurn wraps text and any tool calls in an XML-like tag.
 func renderAssistantTurn(m agentMessage) string {
 	text := contentToText(m.Content)
 	var blocks []string
@@ -360,8 +339,8 @@ func renderSystemTurn(m agentMessage) string {
 	return fmt.Sprintf("<system_message>\n%s\n</system_message>", text)
 }
 
-// renderToolResult renders a tool result inside an XML-like tag with the
-// call_id attribute for unambiguous matching.
+// renderToolResult wraps a result in a tag carrying call_id, so the pairing is
+// unambiguous.
 func renderToolResult(m agentMessage) string {
 	text := contentToText(m.Content)
 	attr := ""
@@ -387,32 +366,27 @@ func renderAgentMessage(m agentMessage) string {
 	case "tool":
 		return renderToolResult(m)
 	default:
-		// Unknown role: render as user with role annotation.
+		// Unknown role: render as user, annotated.
 		text := contentToText(m.Content)
 		return fmt.Sprintf("<user role=%s>\n%s\n</user>", role, text)
 	}
 }
 
-// ============================================================================
-// HISTORY SUMMARISATION
-// ============================================================================
-//
-// Replaying every tool exchange in a long conversation costs the model its
-// focus on the current task, so older turns collapse into a compact block while
-// the most recent stay verbatim.
+// Replaying every tool exchange in a long conversation costs the model its focus
+// on the current task, so older turns collapse into a compact block while the
+// most recent stay verbatim.
 
 // maxRecentToolExchanges is how many recent exchange pairs stay verbatim.
 const maxRecentToolExchanges = 6
 
-// toolExchange records one assistant→tool exchange for summarization.
+// toolExchange is one assistant-to-tool round, kept for summarising.
 type toolExchange struct {
 	toolName string
 	summary  string // truncated tool result
 }
 
-// summarizeOldHistory extracts tool-exchange summaries from older messages and
-// returns a compact <history_summary> block. Returns empty string if there's
-// nothing to summarize.
+// summarizeOldHistory collapses older tool exchanges into a compact
+// <history_summary> block, or "" when there is nothing to summarise.
 func summarizeOldHistory(exchanges []toolExchange) string {
 	if len(exchanges) == 0 {
 		return ""
@@ -426,11 +400,10 @@ func summarizeOldHistory(exchanges []toolExchange) string {
 	return b.String()
 }
 
-// extractToolExchanges scans messages and returns (old exchanges beyond the
-// recent window, messages to render verbatim).
+// extractToolExchanges splits messages into exchanges past the recent window and
+// the messages to render verbatim.
 func extractToolExchanges(messages []agentMessage) (old []toolExchange, recent []agentMessage) {
-	// First pass: identify tool-exchange boundaries.
-	// A tool exchange = assistant with tool_calls followed by 1+ tool results.
+	// An exchange is an assistant with tool_calls plus the tool results after it.
 	type exchange struct{ start, end int } // indices into messages
 	var exchanges []exchange
 	i := 0
@@ -438,7 +411,7 @@ func extractToolExchanges(messages []agentMessage) (old []toolExchange, recent [
 		if messages[i].Role == "assistant" && len(messages[i].ToolCalls) > 0 {
 			ex := exchange{start: i}
 			i++
-			// skip tool results
+			// Consume the results belonging to this call.
 			for i < len(messages) && messages[i].Role == "tool" {
 				i++
 			}
@@ -449,22 +422,22 @@ func extractToolExchanges(messages []agentMessage) (old []toolExchange, recent [
 		}
 	}
 
-	// If there aren't enough exchanges to summarize, keep everything.
+	// Too few to be worth summarising; keep them all.
 	if len(exchanges) <= maxRecentToolExchanges {
 		return nil, messages
 	}
 
-	// Summarize exchanges before the recent window.
+	// Everything before the recent window collapses.
 	splitIdx := exchanges[len(exchanges)-maxRecentToolExchanges].start
 	for _, ex := range exchanges[:len(exchanges)-maxRecentToolExchanges] {
-		// Collect tool names and truncated results from this exchange.
+		// Names plus a truncated result are enough to keep the thread.
 		assistant := messages[ex.start]
 		names := make([]string, 0, len(assistant.ToolCalls))
 		for _, tc := range assistant.ToolCalls {
 			names = append(names, tc.Function.Name)
 		}
 		toolName := strings.Join(names, ", ")
-		// Grab first tool result as summary.
+		// The first result stands in for the rest.
 		summary := "ok"
 		if ex.end > ex.start+1 {
 			result := contentToText(messages[ex.start+1].Content)
@@ -479,8 +452,7 @@ func extractToolExchanges(messages []agentMessage) (old []toolExchange, recent [
 	return old, recent
 }
 
-// buildAgentPrompt assembles the prompt sent to Z.AI, in the section order
-// documented under PROMPT ARCHITECTURE above.
+// buildAgentPrompt assembles the prompt in the section order listed above.
 func buildAgentPrompt(messages []agentMessage, tools []openAITool) string {
 	var b strings.Builder
 
@@ -504,8 +476,7 @@ func buildAgentPrompt(messages []agentMessage, tools []openAITool) string {
 		b.WriteString("</recent>\n\n")
 	}
 
-	// The last user message is anchored separately so the model knows exactly
-	// which message it is answering.
+	// Anchored separately, so the model knows which message it is answering.
 	lastUserIdx := -1
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
@@ -527,15 +498,14 @@ func buildAgentPrompt(messages []agentMessage, tools []openAITool) string {
 	return b.String()
 }
 
-// renderRecentConversation renders recent messages with tool exchanges grouped.
-// Tool calls and their results are wrapped in <tool_exchange> tags so the
-// model can clearly see the call→result pairing.
+// renderRecentConversation groups each call with its result in a
+// <tool_exchange> tag so the pairing is unambiguous to the model.
 func renderRecentConversation(b *strings.Builder, messages []agentMessage) {
 	i := 0
 	for i < len(messages) {
 		m := messages[i]
 
-		// The last user message is skipped here; it goes in <current_task>.
+		// Skipped here: the last user message goes in <current_task>.
 		isLastUser := false
 		if m.Role == "user" {
 			isLastUser = true
@@ -552,7 +522,7 @@ func renderRecentConversation(b *strings.Builder, messages []agentMessage) {
 			continue
 		}
 
-		// Assistant tool calls are grouped with the results that follow them.
+		// Group a call with the results that follow it.
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
 			b.WriteString("<tool_exchange>\n")
 			b.WriteString(renderAssistantTurn(m))
@@ -575,10 +545,9 @@ func renderRecentConversation(b *strings.Builder, messages []agentMessage) {
 	}
 }
 
-// wrapAgentPromptAsMessages wraps the folded prompt as a single Z.AI user
-// message. When the original conversation carried image parts they are appended
-// after the text as an OpenAI content array, so vision survives the fold; a
-// text-only request keeps the plain string content it always had.
+// wrapAgentPromptAsMessages wraps the folded prompt as one Z.AI user message.
+// Image parts are appended after the text as an OpenAI content array so vision
+// survives the fold; a text-only request keeps its plain string content.
 func wrapAgentPromptAsMessages(prompt string, images []json.RawMessage) ([]byte, error) {
 	if len(images) == 0 {
 		return json.Marshal([]map[string]interface{}{
@@ -595,12 +564,9 @@ func wrapAgentPromptAsMessages(prompt string, images []json.RawMessage) ([]byte,
 	})
 }
 
-// extractImageParts collects every image content part from the incoming OpenAI
-// messages, in order, returning each part's JSON verbatim. The agent shim folds
-// text and tools into one prompt string, which structurally cannot carry an
-// image, so these are pulled out and re-attached as a content array. Verbatim
-// passthrough matches the documented Z.AI image_url block, which takes a URL or
-// a base64 data URL under image_url.url.
+// extractImageParts returns every image content part verbatim, in order. The
+// shim folds text and tools into one prompt string, which structurally cannot
+// carry an image, so these are pulled out and re-attached as a content array.
 func extractImageParts(rawMessages json.RawMessage) []json.RawMessage {
 	var msgs []struct {
 		Content json.RawMessage `json:"content"`
@@ -631,42 +597,35 @@ func extractImageParts(rawMessages json.RawMessage) []json.RawMessage {
 	return out
 }
 
-// ============================================================================
-// RESPONSE PARSING
-// ============================================================================
-
 var (
 	agentFenceLead = regexp.MustCompile(`(?i)^` + "```" + `(?:json)?\s*`)
 	agentFenceTail = regexp.MustCompile(`(?i)\s*` + "```" + `$`)
 )
 
-// Models often wrap tool-call blocks in ```json fences even when told not to.
-// These patterns strip only fence lines sitting directly against a marker,
-// never ordinary code blocks elsewhere in the answer. The bracket runs are
+// Models wrap blocks in ```json fences even when told not to. These strip only
+// fence lines touching a marker, never ordinary code blocks. Bracket runs are
 // tolerant for the same reason as findAgentMarker.
 const agentMarkerPat = "(?:<{2,4})TOOL_CALL(?:>{2,4})"
 const agentEndMarkerPat = "(?:<{2,4})END_TOOL_CALL(?:>{2,4})"
 
 var (
-	// fence line immediately before a tool-call opening marker
+	// Fence line immediately before an opening marker.
 	agentFenceBeforeCallRe = regexp.MustCompile("(?:\\A|\r?\n)[ \t]*```(?:json)?[ \t]*\r?\n(" + agentMarkerPat + ")")
-	// fence line right after a tool-call closing marker (keeps the newline that follows)
+	// Fence line right after a closing marker; keeps the newline after it.
 	agentFenceAfterEndRe = regexp.MustCompile("(" + agentEndMarkerPat + ")[ \t]*\r?\n[ \t]*```(?:json)?[ \t]*((?:\r?\n)?)")
-	// bare fence line hanging at the very end of a streamed content piece
+	// Bare fence line left hanging at the end of a streamed piece.
 	agentTrailFenceRe = regexp.MustCompile("(?:\\A|\r?\n)[ \t]*```(?:json)?[ \t]*(?:\r?\n)?\\z")
 )
 
 const agentFenceJSON = "```json"
 
-// agentStreamKeep is the minimum number of trailing bytes the streaming
-// interceptor keeps un-flushed while no marker has matched: enough to cover
-// a fence line plus a partially received marker at its worst tolerated
-// spelling, so neither can ever leak as content. The actual cut is pulled
-// back to a rune boundary, so up to 3 extra bytes may be held.
+// agentStreamKeep is how many trailing bytes the interceptor holds while no
+// marker has matched: enough for a fence line plus a partial marker at its worst
+// tolerated spelling. The cut is pulled back to a rune boundary, so up to 3 more
+// bytes may be held.
 const agentStreamKeep = agentWorstMarkerLen + len("```json\n") + 5
 
-// NormalizeAgentFences removes fence lines adjacent to tool-call markers from
-// finished text (non-streaming path).
+// NormalizeAgentFences strips marker-adjacent fences from finished text.
 func NormalizeAgentFences(text string) string {
 	for {
 		t := agentFenceAfterEndRe.ReplaceAllString(text, "${1}${2}")
@@ -678,15 +637,14 @@ func NormalizeAgentFences(text string) string {
 	}
 }
 
-// TrimTrailingAgentFence drops one fence line hanging at the end of s
-// (the fence the model placed immediately before <<<TOOL_CALL>>>).
+// TrimTrailingAgentFence drops one fence line hanging at the end of s, the one a
+// model puts just before <<<TOOL_CALL>>>.
 func TrimTrailingAgentFence(s string) string {
 	return agentTrailFenceRe.ReplaceAllString(s, "")
 }
 
 // agentPossibleFencePrefix reports whether s is empty or could still grow into a
-// bare fence line, meaning it is too early to treat the bytes after a tool-call
-// block as ordinary content.
+// bare fence line, i.e. too early to call the bytes after a block content.
 func agentPossibleFencePrefix(s string) bool {
 	if s == "" {
 		return true // can't judge yet; wait for more chunks
@@ -699,9 +657,8 @@ func agentPossibleFencePrefix(s string) bool {
 	return false
 }
 
-// SkipLeadingAgentFence returns the length of a bare fence line at the start
-// of s (the ``` the model places immediately after <<<END_TOOL_CALL>>>), or 0
-// if s does not begin with one.
+// SkipLeadingAgentFence returns the length of a bare fence line starting s — the
+// ``` models put right after <<<END_TOOL_CALL>>> — or 0 if there is none.
 func SkipLeadingAgentFence(s string) int {
 	i := 0
 	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
@@ -731,30 +688,24 @@ func SkipLeadingAgentFence(s string) int {
 	return j
 }
 
-// ============================================================================
-// PAYLOAD TOLERANCE
-// ============================================================================
-//
 // The contract asks for {"name":"<tool>","arguments":{...}}, but models invent
-// their own shapes, most often the flat {"tool":"bash","command":"..."} where
-// the name sits under "tool" and the parameters are the remaining top-level
-// keys. A strict {name,arguments} unmarshal accepts those with Name == "", so
-// the block leaks to the client as plain content and the tool never runs. Every
-// shape that unambiguously names a tool and its parameters is therefore taken.
+// shapes, most often flat {"tool":"bash","command":"..."} with the name under
+// "tool" and parameters as the remaining keys. A strict unmarshal accepts that
+// with Name == "", so the block leaks as content and the tool never runs. Hence
+// every shape that unambiguously names a tool and its parameters is taken.
 
-// agentNameKeys are the accepted spellings of the "which tool" key, in priority
-// order. Explicit tool-* keys outrank "name", because in a flat payload a "name"
-// entry is more likely a parameter than the tool itself.
+// agentNameKeys are accepted spellings of the "which tool" key, in priority
+// order. tool-* outranks "name" because in a flat payload a "name" entry is more
+// likely a parameter than the tool.
 var agentNameKeys = []string{"tool", "tool_name", "function", "function_name", "name"}
 
-// agentArgKeys are accepted spellings of the explicit "parameters" key.
+// agentArgKeys are accepted spellings of the explicit parameters key.
 var agentArgKeys = []string{"arguments", "parameters", "args", "params", "input"}
 
-// agentExtractCall resolves (name, arguments) from one decoded tool-call
-// payload object, accepting the canonical shape, alternate key spellings,
-// and flat payloads where the parameters are the remaining top-level keys.
+// agentExtractCall resolves (name, arguments) from one decoded payload, taking
+// the canonical shape, alternate spellings, or a flat object.
 func agentExtractCall(obj map[string]json.RawMessage) (name string, args json.RawMessage, ok bool) {
-	// Locate the tool name under any accepted key spelling.
+	// Find the name under any accepted spelling.
 	nameKey := ""
 	for _, k := range agentNameKeys {
 		raw, present := obj[k]
@@ -771,14 +722,14 @@ func agentExtractCall(obj map[string]json.RawMessage) (name string, args json.Ra
 		return "", nil, false
 	}
 
-	// An explicit arguments object wins over the flat fallback.
+	// An explicit arguments object beats the flat fallback.
 	for _, k := range agentArgKeys {
 		if raw, present := obj[k]; present && !isJSONNull(raw) {
 			return name, raw, true
 		}
 	}
 
-	// Flat payload: every remaining top-level key is a parameter.
+	// Flat payload: every remaining key is a parameter.
 	rest := make(map[string]json.RawMessage, len(obj)-1)
 	for k, v := range obj {
 		if k != nameKey {
@@ -795,14 +746,14 @@ func agentExtractCall(obj map[string]json.RawMessage) (name string, args json.Ra
 	return name, marshaled, true
 }
 
-// isJSONNull reports whether raw is whitespace, JSON null, or empty.
+// isJSONNull reports whether raw is empty, whitespace or JSON null.
 func isJSONNull(raw json.RawMessage) bool {
 	t := bytes.TrimSpace(raw)
 	return len(t) == 0 || bytes.Equal(t, []byte("null"))
 }
 
-// agentLooseParse parses one tool-call body, tolerating markdown fences and
-// the payload shape deviations listed at agentNameKeys / agentArgKeys.
+// agentLooseParse parses one body, tolerating fences and the shape deviations
+// listed at agentNameKeys and agentArgKeys.
 func agentLooseParse(body string) (name string, args json.RawMessage, ok bool) {
 	raw := strings.TrimSpace(body)
 	raw = agentFenceLead.ReplaceAllString(raw, "")
@@ -814,9 +765,8 @@ func agentLooseParse(body string) (name string, args json.RawMessage, ok bool) {
 	return agentExtractCall(obj)
 }
 
-// agentParseArguments normalises model-provided arguments to compact JSON:
-// objects pass through, JSON-encoded strings are parsed, unparsable strings stay
-// quoted.
+// agentParseArguments normalises arguments to compact JSON: objects pass through,
+// JSON-encoded strings are parsed, unparsable strings stay quoted.
 func agentParseArguments(raw json.RawMessage) string {
 	t := bytes.TrimSpace(raw)
 	if len(t) == 0 || bytes.Equal(t, []byte("null")) {
@@ -840,8 +790,8 @@ func agentParseArguments(raw json.RawMessage) string {
 	return "{}"
 }
 
-// agentStreamArguments mirrors the stream path: non-string values are
-// compacted, string values are used verbatim.
+// agentStreamArguments is the stream counterpart: non-strings are compacted,
+// strings used verbatim.
 func agentStreamArguments(raw json.RawMessage) string {
 	t := bytes.TrimSpace(raw)
 	if len(t) == 0 || bytes.Equal(t, []byte("null")) {
@@ -860,7 +810,7 @@ func agentStreamArguments(raw json.RawMessage) string {
 	return "{}"
 }
 
-// agentRandomHex returns n random bytes as lowercase hex, for call-id suffixes.
+// agentRandomHex returns n random bytes as hex, for call-id suffixes.
 func agentRandomHex(n int) string {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -869,8 +819,8 @@ func agentRandomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// ParseAgentToolCalls extracts every complete tool-call block from finished
-// text and returns OpenAI-format tool_calls objects.
+// ParseAgentToolCalls turns every complete block in finished text into
+// OpenAI-format tool_calls objects.
 func ParseAgentToolCalls(text string) []map[string]interface{} {
 	text = NormalizeAgentFences(text)
 	var calls []map[string]interface{}
@@ -891,7 +841,7 @@ func ParseAgentToolCalls(text string) []map[string]interface{} {
 	return calls
 }
 
-// StripAgentToolCalls removes all tool-call blocks from finished text.
+// StripAgentToolCalls removes every block from finished text.
 func StripAgentToolCalls(text string) string {
 	text = NormalizeAgentFences(text)
 	var kept strings.Builder
@@ -904,13 +854,9 @@ func StripAgentToolCalls(text string) string {
 	return strings.TrimSpace(kept.String())
 }
 
-// ============================================================================
-// STREAMING INTERCEPTOR
-// ============================================================================
-
 // AgentStreamInterceptor incrementally separates ordinary text from tool-call
-// blocks. It retains a short suffix so a marker split across upstream chunks
-// is never leaked to the client.
+// blocks, retaining a short suffix so a marker split across upstream chunks is
+// never leaked to the client.
 type AgentStreamInterceptor struct {
 	buffer     string
 	offset     int
@@ -923,15 +869,38 @@ type AgentParsedChunk struct {
 	ToolCalls []map[string]interface{}
 }
 
+// maxAgentHold caps text held back waiting for a marker to close. Generous, so only a
+// stream that opened a tool call and never closed it can reach it.
+const maxAgentHold = 4 << 20
+
 func (in *AgentStreamInterceptor) Feed(chunk string) AgentParsedChunk {
 	in.buffer += chunk
-	return in.drain(false)
+	parsed := in.drain(false)
+	in.compact()
+
+	// An unterminated marker pins offset, so compact cannot advance and the buffer
+	// would grow with the whole response. Past the cap, stop waiting and emit it.
+	if len(in.buffer)-in.offset > maxAgentHold {
+		parsed.Content += in.buffer[in.offset:]
+		in.buffer = ""
+		in.offset = 0
+	}
+	return parsed
 }
 
-// Finish drains the interceptor at end of stream, treating the buffered tail as
-// complete: a marker whose trailing '>' run touches the very end can now match,
-// and whatever remains unparsed is ordinary content. Tool calls discovered here
-// must still be forwarded to the client.
+// compact drops the consumed prefix. Without it Feed's string append is quadratic in
+// the response length: a 1 MB answer in 2 KB deltas moves gigabytes.
+func (in *AgentStreamInterceptor) compact() {
+	if in.offset == 0 || in.offset > len(in.buffer) {
+		return
+	}
+	in.buffer = in.buffer[in.offset:]
+	in.offset = 0
+}
+
+// Finish drains at end of stream, treating the buffered tail as complete: a
+// marker whose trailing '>' run touches the end can now match, and anything left
+// unparsed is ordinary content. Tool calls found here still need forwarding.
 func (in *AgentStreamInterceptor) Finish() AgentParsedChunk {
 	parsed := in.drain(true)
 	in.offset = len(in.buffer)
@@ -943,9 +912,9 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 	var toolCalls []map[string]interface{}
 
 	for {
-		// Right after a tool-call block, swallow blank space and stray fence
-		// lines the model appends despite instructions, possibly split across
-		// chunks. Content elsewhere, including real code blocks, is untouched.
+		// Straight after a block, swallow blank space and stray fence lines the
+		// model appends anyway, possibly split across chunks. Content elsewhere,
+		// real code blocks included, is untouched.
 		if in.pendingSep {
 			for {
 				for in.offset < len(in.buffer) && isASCIISpace(in.buffer[in.offset]) {
@@ -967,19 +936,18 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 		start, markerLen := findAgentMarker(rest, agentStartWord, final)
 		if start < 0 {
 			if final {
-				// End of data: everything left is ordinary content.
+				// End of data: the rest is ordinary content.
 				if rest != "" {
 					content = append(content, rest)
 					in.offset = len(in.buffer)
 				}
 				break
 			}
-			// Hold back a window wide enough for a fence line plus a partial
-			// marker, so neither leaks as content while split across chunks. A
-			// marker reported incomplete keeps its bytes inside this window, so
-			// nothing here can belong to a future match. The cut backs up to a
-			// rune boundary; splitting a multi-byte character would render as
-			// replacement-char garble on the client (issue #23).
+			// Hold a window wide enough for a fence line plus a partial marker,
+			// so neither leaks while split across chunks. An incomplete marker
+			// keeps its bytes inside this window, so nothing held can belong to a
+			// future match. The cut backs up to a rune boundary; splitting one
+			// would garble as U+FFFD (issue #23).
 			const keep = agentStreamKeep
 			if len(rest) > keep {
 				cut := len(rest) - keep
@@ -1019,7 +987,7 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 			})
 			in.callIndex++
 		} else {
-			// Unparsable block: leave it as visible text.
+			// Unparsable: leave it as visible text.
 			content = append(content, in.buffer[in.offset:end+endMarkerLen])
 		}
 		in.offset = end + endMarkerLen
@@ -1032,16 +1000,12 @@ func isASCIISpace(b byte) bool {
 	return b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == '\v' || b == '\f'
 }
 
-// ============================================================================
-// SHIM DISPATCH
-// ============================================================================
-//
-// The modern shim in this file and the legacy one in agent_legacy.go expose
-// slightly different APIs. These adapters present one surface, so the request
-// handlers select the active shim purely from config.
+// The modern shim here and the legacy one in agent_legacy.go expose slightly
+// different APIs. These adapters present one surface, so the handlers select the
+// active shim purely from config.
 
-// transformMessagesForAgentModern folds the conversation and tool contract into
-// one sectioned prompt, wrapped as a single Z.AI user message.
+// transformMessagesForAgentModern folds conversation and contract into one
+// sectioned prompt, wrapped as a single user message.
 func transformMessagesForAgentModern(rawMessages json.RawMessage, toolsRaw json.RawMessage) ([]byte, error) {
 	var msgs []agentMessage
 	if err := json.Unmarshal(rawMessages, &msgs); err != nil {
@@ -1055,8 +1019,7 @@ func transformMessagesForAgentModern(rawMessages json.RawMessage, toolsRaw json.
 	return wrapAgentPromptAsMessages(prompt, extractImageParts(rawMessages))
 }
 
-// agentTransformMessages rewrites the incoming OpenAI messages array for the
-// active agent shim, returning the JSON-encoded messages to send upstream.
+// agentTransformMessages rewrites the messages array for the active shim.
 func agentTransformMessages(rawMessages, toolsRaw json.RawMessage) ([]byte, error) {
 	if config.agentModern() {
 		return transformMessagesForAgentModern(rawMessages, toolsRaw)
@@ -1068,7 +1031,7 @@ func agentTransformMessages(rawMessages, toolsRaw json.RawMessage) ([]byte, erro
 	return transformMessagesForAgent(rawMessages, tools)
 }
 
-// agentExtractToolCalls parses tool-call blocks out of finished assistant text.
+// agentExtractToolCalls lifts tool calls out of finished assistant text.
 func agentExtractToolCalls(text string) []map[string]interface{} {
 	if config.agentModern() {
 		return ParseAgentToolCalls(text)
@@ -1076,7 +1039,7 @@ func agentExtractToolCalls(text string) []map[string]interface{} {
 	return extractAgentToolCalls(text)
 }
 
-// agentStripToolCalls removes tool-call blocks from finished assistant text.
+// agentStripToolCalls removes them, leaving the residual text.
 func agentStripToolCalls(text string) string {
 	if config.agentModern() {
 		return StripAgentToolCalls(text)
@@ -1084,8 +1047,8 @@ func agentStripToolCalls(text string) string {
 	return stripAgentToolCallBlocks(text)
 }
 
-// agentInterceptor is the streaming surface both protocol handlers use: feed
-// processes one upstream chunk, finish drains the tail at end of stream.
+// agentInterceptor is the streaming surface both handlers use: feed takes one
+// upstream chunk, finish drains the tail.
 type agentInterceptor interface {
 	feed(chunk string) (content string, toolCalls []map[string]interface{})
 	finish() (content string, toolCalls []map[string]interface{})
@@ -1104,7 +1067,7 @@ func (m *modernAgentInterceptor) finish() (string, []map[string]interface{}) {
 }
 
 // legacyAgentInterceptor streams arguments incrementally. Its finish returns
-// only trailing content; end-of-stream tool calls are caught by the caller's
+// trailing content only; end-of-stream calls fall to the caller's
 // agentExtractToolCalls safety net.
 type legacyAgentInterceptor struct{ in *agentStreamInterceptor }
 
@@ -1117,7 +1080,7 @@ func (l *legacyAgentInterceptor) finish() (string, []map[string]interface{}) {
 	return l.in.flushFinal(), nil
 }
 
-// newAgentInterceptor constructs the streaming interceptor for the active shim.
+// newAgentInterceptor builds the interceptor for the active shim.
 func newAgentInterceptor() agentInterceptor {
 	if config.agentModern() {
 		return &modernAgentInterceptor{in: &AgentStreamInterceptor{}}

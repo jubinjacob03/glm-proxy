@@ -1,15 +1,13 @@
-// sse_reasoning_dup_repro_test.go
 // Regression tests for reasoning_content arriving as repeated growing prefixes
 // even though the upstream stream is correct.
 //
-// Z.AI streams the <details> body one character at a time, and each reasoning
-// line is markdown-quoted. While a new line's quote marker is half-arrived (the
-// raw tail is "\n>"), stripDetailsTags cannot strip the bare ">" — TrimPrefix
-// needs the space — so the stripped snapshot transiently ends in ">". One
-// character later the "> " completes and the marker disappears, making the
-// snapshot sequence non-monotonic. The sseEmitter then diverged: its tracked
-// view kept the stale ">" tail, every later snapshot shared only the pre-">"
-// prefix, and everything after that point was re-emitted on every flush.
+// Z.AI streams the <details> body a character at a time and each reasoning line is
+// markdown-quoted. While a new line's marker is half-arrived (raw tail "\n>"),
+// stripDetailsTags cannot strip the bare ">" because TrimPrefix needs the space,
+// so the stripped snapshot transiently ends in ">". A character later the marker
+// completes and vanishes, making the sequence non-monotonic. sseEmitter then
+// diverged: its view kept the stale ">" tail, later snapshots shared only the
+// pre-">" prefix, and the remainder was re-emitted on every flush.
 
 package zbridge
 
@@ -21,7 +19,7 @@ import (
 	"unicode/utf8"
 )
 
-// utf16Len returns the number of UTF-16 code units of s (JS string length).
+// utf16Len is s.length as JavaScript computes it.
 func utf16Len(s string) int {
 	n := 0
 	for i := 0; i < len(s); {
@@ -36,11 +34,9 @@ func utf16Len(s string) int {
 	return n
 }
 
-// editAppendEventsFrom builds one SSE event per rune of `add`,
-// appending each rune at the running UTF-16 end-of-content offset —
-// exactly the way the Z.AI prod-fe reconstructs it: content =
-// content.substring(0, edit_index) + edit_content. It returns the
-// events and the new accumulated content.
+// editAppendEventsFrom builds one SSE event per rune of add, appending each at the
+// running UTF-16 end offset, exactly as prod-fe reconstructs it. Returns the events
+// and the new accumulated content.
 func editAppendEventsFrom(existing, add string) (string, string) {
 	var body strings.Builder
 	cur := existing
@@ -59,20 +55,20 @@ func editAppendEventsFrom(existing, add string) (string, string) {
 	return body.String(), cur
 }
 
-// editAppendEvents appends to an empty stream.
+// editAppendEvents starts from empty content.
 func editAppendEvents(full string) string {
 	body, _ := editAppendEventsFrom("", full)
 	return body
 }
 
-// editAppendStream wraps editAppendEvents with the stream terminators.
+// editAppendStream adds the stream terminators.
 func editAppendStream(full string) string {
 	return editAppendEvents(full) +
 		sseEvent(`{"data":{"phase":"done"}}`) +
 		"data: [DONE]\n\n"
 }
 
-// collectReasoning concatenates every Reasoning delta the parser emits.
+// collectReasoning concatenates every Reasoning delta emitted.
 func collectReasoning(results []ZAIResult) string {
 	var sb strings.Builder
 	for _, r := range results {
@@ -81,9 +77,9 @@ func collectReasoning(results []ZAIResult) string {
 	return sb.String()
 }
 
-// TestSSEReasoningQuotedLinesNoDuplication streams a <details> reasoning
-// block whose lines carry "> " quote markers one character at a time.
-// The client must receive the reasoning exactly once.
+// TestSSEReasoningQuotedLinesNoDuplication streams a <details> block whose lines
+// carry "> " markers one character at a time; the client must receive the
+// reasoning exactly once.
 func TestSSEReasoningQuotedLinesNoDuplication(t *testing.T) {
 	line1 := "First: OS release. `cat /etc/os-release` — but the instructions say use read tool for text files."
 	line2 := "That's for workspace files generally. But for system info gathering, bash is the natural approach."
@@ -105,7 +101,7 @@ func TestSSEReasoningQuotedLinesNoDuplication(t *testing.T) {
 				t.Errorf("holdback=%d: reasoning duplicated %d times (growing-prefix symptom)", hb, n)
 			}
 
-			// Content channel must carry only the answer.
+			// The content channel must carry the answer and nothing else.
 			clientText, _ := replayClientView(results)
 			if clientText != "The answer." {
 				t.Errorf("holdback=%d: client content = %q, want %q", hb, clientText, "The answer.")
@@ -114,9 +110,9 @@ func TestSSEReasoningQuotedLinesNoDuplication(t *testing.T) {
 	}
 }
 
-// TestSSEReasoningQuoteMarkerPartialArrival isolates the trigger: a
-// partially-streamed "> " marker must never reach the client, and the
-// tail rewrite it causes must not duplicate anything after it.
+// TestSSEReasoningQuoteMarkerPartialArrival isolates the trigger: a half-streamed
+// "> " marker must never reach the client, and the tail rewrite it causes must not
+// duplicate what follows.
 func TestSSEReasoningQuoteMarkerPartialArrival(t *testing.T) {
 	withHoldback(t, 0, func() {
 		full := "<details>> abc\n> def</details>ok"
@@ -132,10 +128,9 @@ func TestSSEReasoningQuoteMarkerPartialArrival(t *testing.T) {
 	})
 }
 
-// TestSSEReasoningGrowthDeltasAreIncremental asserts the append-only
-// client view never diverges from the expected reasoning: every
-// partial concatenation of Reasoning deltas must stay a prefix of the
-// final text (a re-emitted growing prefix violates this immediately).
+// TestSSEReasoningGrowthDeltasAreIncremental asserts the append-only client view
+// never diverges: every partial concatenation of deltas must stay a prefix of the
+// final text, which a re-emitted growing prefix violates immediately.
 func TestSSEReasoningGrowthDeltasAreIncremental(t *testing.T) {
 	withHoldback(t, 0, func() {
 		line1 := "First: OS release. `cat /etc/os-release`."
@@ -159,17 +154,15 @@ func TestSSEReasoningGrowthDeltasAreIncremental(t *testing.T) {
 	})
 }
 
-// TestSSEReasoningTailBacktrackAbsorbed verifies that a trailing
-// edit_content backtrack inside the reasoning (the model revising the
-// tail of its thinking) is absorbed by the hold-back window, so the
-// client converges exactly — no stale fragment, no duplication.
+// TestSSEReasoningTailBacktrackAbsorbed verifies the hold-back window absorbs a
+// trailing edit_content backtrack — the model revising the tail of its thinking —
+// so the client converges exactly, with no stale fragment and no duplication.
 func TestSSEReasoningTailBacktrackAbsorbed(t *testing.T) {
 	withHoldback(t, 24, func() {
-		// Reasoning grows past the hold-back window, then the model
-		// backtracks inside the window and retypes the tail, then the
-		// block closes and the answer follows.
+		// Grow past the window, backtrack inside it and retype the tail, then
+		// close the block and answer.
 		quoted := "> " + strings.Repeat("thinking text ", 12)
-		body, cur := editAppendEventsFrom("", "<details>"+quoted+"wrong tail")
+		body, _ := editAppendEventsFrom("", "<details>"+quoted+"wrong tail")
 		// Backtrack: replace "wrong tail" with "right end".
 		prefix := "<details>" + quoted
 		payload, _ := json.Marshal(map[string]interface{}{
@@ -179,7 +172,7 @@ func TestSSEReasoningTailBacktrackAbsorbed(t *testing.T) {
 			},
 		})
 		body += sseEvent(string(payload))
-		cur = prefix + "right end"
+		cur := prefix + "right end"
 		tail, _ := editAppendEventsFrom(cur, "</details>ans")
 		body += tail
 		body += sseEvent(`{"data":{"phase":"done"}}`)
@@ -201,7 +194,7 @@ func TestSSEReasoningTailBacktrackAbsorbed(t *testing.T) {
 	})
 }
 
-// TestHoldBackPartialQuoteMarker covers the new helper directly.
+// TestHoldBackPartialQuoteMarker covers the helper directly.
 func TestHoldBackPartialQuoteMarker(t *testing.T) {
 	cases := []struct{ s, want string }{
 		{"", ""},

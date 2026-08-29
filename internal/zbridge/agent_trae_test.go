@@ -1,7 +1,7 @@
 package zbridge
 
-// Regression tests for the two capabilities an agentic IDE (TRAE) exercises
-// hardest through the OpenAI protocol: image attachments and tool calls.
+// Regression tests for the two things an agentic IDE (TRAE) leans on hardest over
+// the OpenAI protocol: image attachments and tool calls.
 
 import (
 	"encoding/json"
@@ -12,9 +12,7 @@ import (
 	"testing"
 )
 
-// ============================================================================
-// VISION — image parts must survive the agent-mode fold
-// ============================================================================
+// Vision: image parts must survive the agent-mode fold.
 
 const visionMessages = `[
   {"role":"system","content":"You are a coding assistant."},
@@ -110,15 +108,12 @@ func TestExtractImagePartsOrder(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// TOOL CALLS — streamed shape an OpenAI client assembles
-// ============================================================================
+// Tool calls: the streamed shape an OpenAI client assembles.
 
-// TestToolCallStreamShape drives the real OpenAI handler against a mock Z.AI
-// upstream that emits a modern-shim tool-call block, then asserts the streamed
-// chunks carry everything an OpenAI-compatible agent client needs: an opening
-// role, and tool_call deltas with index, id, type, and valid-JSON arguments,
-// closed by finish_reason=tool_calls.
+// TestToolCallStreamShape drives the real handler against a mock upstream emitting
+// a modern-shim block, then asserts the chunks carry everything an OpenAI client
+// needs: an opening role, then tool_call deltas with index, id, type and
+// valid-JSON arguments, closed by finish_reason=tool_calls.
 func TestToolCallStreamShape(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

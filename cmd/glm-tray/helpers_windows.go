@@ -3,10 +3,14 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -14,15 +18,15 @@ import (
 
 // Windows process-creation flags.
 const (
-	createNoWindow   = 0x08000000 // child runs with no console window
-	createNewConsole = 0x00000010 // Monitor opens its own console window
+	createNoWindow         = 0x08000000 // child runs with no console window
+	detachedProcess        = 0x00000008 // installer survives this process exiting
+	createBreakawayFromJob = 0x01000000 // installer escapes the kill-on-close job
 )
 
-// jobHandle binds the proxy child's lifetime to this tray process. A job with
-// KILL_ON_JOB_CLOSE means the OS terminates the child (and its own children,
-// e.g. a token-collector browser) whenever the tray exits for ANY reason —
-// clean quit, crash, or a force-kill from Task Manager — so the proxy is never
-// left orphaned.
+// jobHandle binds the proxy child's lifetime to this process. KILL_ON_JOB_CLOSE
+// makes the OS terminate the child and its own children (a token-collector
+// browser, say) however the tray exits — clean quit, crash or Task Manager — so
+// the proxy is never orphaned.
 var jobHandle windows.Handle
 
 func initJobObject() {
@@ -47,7 +51,7 @@ func initJobObject() {
 	jobHandle = h
 }
 
-// assignToJob places a freshly started child into the kill-on-close job.
+// assignToJob puts a freshly started child into the kill-on-close job.
 func assignToJob(pid int) {
 	if jobHandle == 0 {
 		return
@@ -72,9 +76,8 @@ const (
 	mbTopMost         = 0x00040000
 )
 
-// notify shows a small modal message box. It is used sparingly: startup errors
-// and confirmations the user explicitly triggered. Routine status goes to the
-// log, not the screen.
+// notify shows a small modal message box, used sparingly: startup errors and
+// confirmations the user triggered. Routine status goes to the log.
 func notify(title, message string) {
 	titlePtr, _ := syscall.UTF16PtrFromString(title)
 	msgPtr, _ := syscall.UTF16PtrFromString(message)
@@ -86,18 +89,20 @@ func notify(title, message string) {
 	)
 }
 
-// promptToken shows a single-line input box and returns what the user typed.
-// The second result is false if they cancelled. It shells out to the
-// VisualBasic InputBox, which needs no extra dependency and no window of our
-// own; the helper process itself runs without a console.
+// promptToken shows a single-line input box, returning false if cancelled. It
+// shells out to the VisualBasic InputBox, which needs no extra dependency and no
+// window of our own.
 func promptToken() (string, bool) {
 	const script = `Add-Type -AssemblyName Microsoft.VisualBasic; ` +
 		`[Microsoft.VisualBasic.Interaction]::InputBox(` +
 		`'Paste your new ZAI token. The proxy will restart to apply it.',` +
-		`'GLM Proxy - Update token','')`
+		`'GLM Proxy - Change token','')`
 
 	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+	// createNoWindow hides PowerShell's console, but NOT HideWindow: its SW_HIDE
+	// propagates into the .NET InputBox, so the dialog is created invisible and,
+	// being modal, Output() then blocks forever on a window nobody can see.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	out, err := cmd.Output()
 	if err != nil {
 		return "", false
@@ -109,27 +114,76 @@ func promptToken() (string, bool) {
 	return token, true
 }
 
-// openMonitor opens a new console window tailing the proxy's console log, which
-// is exactly what a local `zai-api.exe` run prints. Get-Content -Wait follows
-// new lines as they arrive.
+// openMonitor opens a console window following the proxy log.
+//
+// It goes through cmd's start because that builds the console itself.
+// CREATE_NEW_CONSOLE leaves cmd.Stdout nil, so os/exec hands the child the null
+// device and PowerShell discards every line into a permanently empty window.
 func openMonitor(logPath string) {
+	// logs\ may have been deleted since startup; recreate it so os.Create below
+	// does not fail with a raw path-not-found the user cannot act on.
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
 	if _, err := os.Stat(logPath); err != nil {
-		// Create an empty file so the tail has something to follow.
+		// Give the follower something to open.
 		if f, cerr := os.Create(logPath); cerr == nil {
 			f.Close()
 		}
 	}
-	escaped := strings.ReplaceAll(logPath, "'", "''")
-	script := "$host.UI.RawUI.WindowTitle='GLM Proxy - Monitor'; " +
-		"Get-Content -LiteralPath '" + escaped + "' -Wait -Tail 200"
 
-	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", script)
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNewConsole}
+	// A file, not -Command: a path survives start's quoting where a script does not.
+	scriptPath := filepath.Join(filepath.Dir(logPath), monitorScriptName)
+	if err := os.WriteFile(scriptPath, []byte(monitorScript(logPath)), 0o644); err != nil {
+		notify("GLM proxy", "Could not write the Monitor script:\n"+err.Error())
+		return
+	}
+
+	cmd := exec.Command("cmd", "/c", "start", "GLM Proxy - Monitor",
+		"powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NoExit", "-File", scriptPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
 	_ = cmd.Start()
 }
 
-// setEnvValue rewrites (or inserts) a KEY=value line in an .env file, leaving
-// every other line untouched. A missing file is created.
+// monitorScript is the follower openMonitor writes out; separate so it is testable.
+func monitorScript(logPath string) string {
+	quoted := "'" + strings.ReplaceAll(logPath, "'", "''") + "'"
+
+	return strings.Join([]string{
+		`$ErrorActionPreference = 'Continue'`,
+		`try { $Host.UI.RawUI.WindowTitle = 'GLM Proxy - Monitor' } catch {}`,
+		`try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}`,
+		`$path = ` + quoted,
+		`Write-Host ('Following ' + $path) -ForegroundColor DarkGray`,
+		`Write-Host 'Closing this window stops watching only; the proxy keeps running.' -ForegroundColor DarkGray`,
+		`Write-Host ''`,
+		// Bounded so a long crash-restart history cannot bury the useful end.
+		`$backlogMax = 262144`,
+		`$pos = 0`,
+		`try {`,
+		`  $len = (Get-Item -LiteralPath $path).Length`,
+		`  if ($len -gt $backlogMax) { $pos = $len - $backlogMax }`,
+		`} catch {}`,
+		`while ($true) {`,
+		`  try {`,
+		`    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete`,
+		`    $fs = New-Object System.IO.FileStream($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)`,
+		`    if ($fs.Length -lt $pos) { $pos = 0 }`,
+		`    [void]$fs.Seek($pos, [System.IO.SeekOrigin]::Begin)`,
+		`    $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8)`,
+		`    $chunk = $sr.ReadToEnd()`,
+		`    $pos = $fs.Position`,
+		`    $sr.Dispose()`,
+		`    $fs.Dispose()`,
+		`    if ($chunk.Length -gt 0) { Write-Host -NoNewline -Object $chunk }`,
+		`  } catch {`,
+		`    Start-Sleep -Milliseconds 700`,
+		`  }`,
+		`  Start-Sleep -Milliseconds 300`,
+		`}`,
+	}, "\n")
+}
+
+// setEnvValue rewrites or inserts one KEY=value line, leaving the rest untouched.
+// A missing file is created.
 func setEnvValue(path, key, value string) error {
 	var lines []string
 	if data, err := os.ReadFile(path); err == nil {
@@ -158,4 +212,191 @@ func setEnvValue(path, key, value string) error {
 		out += "\n"
 	}
 	return os.WriteFile(path, []byte(out), 0o600)
+}
+
+// getEnvValue reads one KEY=value, returning "" if the file or key is absent.
+// Surrounding quotes are stripped.
+func getEnvValue(path, key string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		trimmed = strings.TrimPrefix(trimmed, "export ")
+		eq := strings.IndexByte(trimmed, '=')
+		if eq <= 0 || strings.TrimSpace(trimmed[:eq]) != key {
+			continue
+		}
+		val := strings.TrimSpace(trimmed[eq+1:])
+		if len(val) >= 2 {
+			if (val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'') {
+				val = val[1 : len(val)-1]
+			}
+		}
+		return val
+	}
+	return ""
+}
+
+// launchInstaller starts the staged NSIS installer silently and detached. It
+// stops this tray itself, so it must outlive us: DETACHED_PROCESS plus
+// CREATE_BREAKAWAY_FROM_JOB keeps it clear of our console and of the
+// kill-on-close job that owns the proxy child.
+//
+// With relaunch set, /RESTART starts the new tray when it finishes; otherwise the
+// app returns at the next login through the Run key.
+func launchInstaller(installerPath string, relaunch bool) error {
+	args := []string{"/S"}
+	if relaunch {
+		args = append(args, "/RESTART")
+	}
+	cmd := exec.Command(installerPath, args...)
+	cmd.Dir = filepath.Dir(installerPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: createNoWindow | detachedProcess | createBreakawayFromJob,
+	}
+	if err := cmd.Start(); err != nil {
+		// A job that forbids breakaway rejects the flag, so retry without it.
+		cmd = exec.Command(installerPath, args...)
+		cmd.Dir = filepath.Dir(installerPath)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			HideWindow:    true,
+			CreationFlags: createNoWindow | detachedProcess,
+		}
+		if err2 := cmd.Start(); err2 != nil {
+			return err2
+		}
+	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Release()
+	}
+	return nil
+}
+
+// logUpdate appends to the tray's own update log; update activity is background
+// work, so it is recorded rather than shown as a dialog.
+func logUpdate(format string, args ...interface{}) {
+	line := time.Now().Format("2006/01/02 15:04:05") + " " + fmt.Sprintf(format, args...) + "\r\n"
+	if sup == nil {
+		return
+	}
+	path := filepath.Join(sup.dir, "logs", "update.log")
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(line)
+}
+
+var (
+	kernel32         = syscall.NewLazyDLL("kernel32.dll")
+	procCreateMutexW = kernel32.NewProc("CreateMutexW")
+
+	// Held for the life of the process; Windows releases the mutex on exit,
+	// however that exit happens.
+	instanceHandle uintptr
+)
+
+const errAlreadyExists = syscall.Errno(183)
+
+// acquireSingleInstance takes a named mutex so only one tray runs per session;
+// otherwise autostart plus a manual launch would leave two trays supervising two
+// proxies fighting over the same port.
+//
+// An update relaunch is the tricky case: the installer force-kills the old tray
+// and starts the new one immediately, so the mutex may still be held briefly.
+// Giving up would leave the app not running at all after an update, so this
+// retries and only refuses once another instance is clearly alive.
+func acquireSingleInstance(name string) bool {
+	namePtr, err := syscall.UTF16PtrFromString(name)
+	if err != nil {
+		return true // cannot build the name; never block startup over it
+	}
+	deadline := time.Now().Add(12 * time.Second)
+	for {
+		h, _, lastErr := procCreateMutexW.Call(0, 1, uintptr(unsafe.Pointer(namePtr)))
+		if h == 0 {
+			return true // cannot create the mutex; prefer running over refusing
+		}
+		if lastErr != errAlreadyExists {
+			instanceHandle = h
+			return true
+		}
+		windows.CloseHandle(windows.Handle(h))
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(400 * time.Millisecond)
+	}
+}
+
+// showUpdateSplash keeps a small always-on-top window up while an update
+// downloads and installs, so a launch that pauses to update does not look like
+// one that failed. The returned function dismisses it.
+func showUpdateSplash(version string) func() {
+	label := "Installing update"
+	if version != "" {
+		label += " v" + version
+	}
+	label += "..."
+	safe := strings.ReplaceAll(label, "'", "''")
+
+	// The tray exits mid-update, so a parent-PID watchdog plus a hard cap close this
+	// window when the parent goes or after a timeout, never orphaning it on screen.
+	parentPID := os.Getpid()
+
+	script := `Add-Type -AssemblyName System.Windows.Forms; ` +
+		`Add-Type -AssemblyName System.Drawing; ` +
+		`$f = New-Object System.Windows.Forms.Form; ` +
+		`$f.Text = 'GLM Proxy'; ` +
+		`$f.Size = New-Object System.Drawing.Size(380,130); ` +
+		`$f.StartPosition = 'CenterScreen'; ` +
+		`$f.FormBorderStyle = 'FixedDialog'; ` +
+		`$f.ControlBox = $false; ` +
+		`$f.TopMost = $true; ` +
+		`$l = New-Object System.Windows.Forms.Label; ` +
+		`$l.Text = '` + safe + `'; ` +
+		`$l.AutoSize = $false; ` +
+		`$l.Size = New-Object System.Drawing.Size(340,24); ` +
+		`$l.Location = New-Object System.Drawing.Point(20,18); ` +
+		`$p = New-Object System.Windows.Forms.ProgressBar; ` +
+		`$p.Style = 'Marquee'; ` +
+		`$p.MarqueeAnimationSpeed = 30; ` +
+		`$p.Size = New-Object System.Drawing.Size(340,20); ` +
+		`$p.Location = New-Object System.Drawing.Point(20,52); ` +
+		`$f.Controls.Add($l); $f.Controls.Add($p); ` +
+		`$ticks = 0; ` +
+		`$t = New-Object System.Windows.Forms.Timer; ` +
+		`$t.Interval = 1000; ` +
+		`$t.Add_Tick({ ` +
+		`  $script:ticks++; ` +
+		`  $alive = $true; ` +
+		`  try { $null = Get-Process -Id ` + fmt.Sprint(parentPID) + ` -ErrorAction Stop } catch { $alive = $false } ` +
+		`  if (-not $alive -or $script:ticks -ge 180) { $f.Close() } ` +
+		`}); ` +
+		`$t.Start(); ` +
+		`[void]$f.ShowDialog()`
+
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+	// No HideWindow: its SW_HIDE would make the splash form invisible, the same way
+	// it hid the token dialog. createNoWindow still suppresses the PowerShell console.
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
+	if err := cmd.Start(); err != nil {
+		return func() {}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			_, _ = cmd.Process.Wait()
+		})
+	}
 }

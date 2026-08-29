@@ -9,10 +9,6 @@ import (
 	"time"
 )
 
-// ============================================================================
-// Z.AI TYPES
-// ============================================================================
-
 type Features struct {
 	WebSearch     bool `json:"webSearch"`
 	AutoWebSearch bool `json:"autoWebSearch"`
@@ -38,9 +34,9 @@ type SessionState struct {
 	Features     Features
 	Initialized  bool
 	Initializing bool
-	// initWait is closed when an in-flight initialisation finishes and
-	// initErr carries its outcome, so concurrent callers all observe the same
-	// result rather than assuming success.
+	// initWait closes when an in-flight init finishes and initErr carries the
+	// outcome, so concurrent callers see the same result instead of assuming
+	// success.
 	initWait chan struct{}
 	initErr  error
 }
@@ -61,7 +57,7 @@ type SendOptions struct {
 	ChatID            string
 	Messages          []Message
 	ClientMessagesRaw json.RawMessage
-	ReasoningEffort   string // "high" or "max"; only forwarded if model supports it
+	ReasoningEffort   string // "high" or "max"; forwarded only if the model supports it
 }
 
 type ResponseResult struct {
@@ -72,9 +68,7 @@ type ResponseResult struct {
 	Reasoning    string
 }
 
-// ============================================================================
-// ALIYUN CAPTCHA WIRE TYPES
-// ============================================================================
+// Aliyun captcha wire types.
 
 type InitCaptchaResponse struct {
 	CertifyID string `json:"CertifyId"`
@@ -122,9 +116,8 @@ type Track struct {
 	Arg            string    `json:"arg"`
 }
 
-// ============================================================================
-// GLOBAL STATE
-// ============================================================================
+// Process-wide state. session is guarded by session.mu; the rest are atomics or
+// written once at startup.
 
 var (
 	dbPath   string
@@ -138,7 +131,7 @@ var session = &SessionState{
 	UserName:  "Guest",
 	SaltKey:   SALT_KEY,
 	FeVersion: DEFAULT_FE_VERSION,
-	Features:  Features{Thinking: true}, // enable_thinking on by default
+	Features:  Features{Thinking: true}, // enable_thinking defaults on
 }
 
 type ModelInfo struct {
@@ -152,11 +145,13 @@ var (
 	modelsCache     []ModelInfo
 	modelsCacheTime time.Time
 	modelsCacheMu   sync.Mutex
+	// One refresh in flight at a time; others serve the previous list.
+	modelsRefreshing bool
 )
 
 const modelsCacheTTL = 5 * time.Minute
 
-// Used when the Z.AI API is unreachable and the cache is empty.
+// Served when Z.AI is unreachable and the cache is empty.
 var fallbackModels = []ModelInfo{
 	{ID: "glm-5.3", Name: "GLM-5.3", Description: "Flagship model, excels at coding and long-horizon tasks"},
 	{ID: "glm-5.2", Name: "GLM-5.2", Description: "Previous flagship model"},
@@ -167,9 +162,8 @@ var fallbackModels = []ModelInfo{
 
 var feVersionRe = regexp.MustCompile(`prod-fe-\d+\.\d+\.\d+`)
 
-// ModelFeatureState is the per-model feature configuration. IncludeAll sends
-// every server capability to /completions; Overrides are user-supplied values
-// keyed by the real snake_case capability name.
+// ModelFeatureState is per-model feature config: IncludeAll forwards every
+// server capability, Overrides are user values keyed by snake_case name.
 type ModelFeatureState struct {
 	IncludeAll bool
 	Overrides  map[string]interface{}

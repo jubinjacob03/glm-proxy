@@ -1,21 +1,18 @@
-// sse_garble_test.go
-// Regression tests for issue #23 (输出乱码的问题): garbled characters
-// interspersed in streamed output. Three causes, each verified against the
-// official Z.AI web frontend:
+// Regression tests for issue #23 (输出乱码的问题): garbled characters interspersed
+// in streamed output. Three causes, each checked against Z.AI's own frontend:
 //
-//  1. edit_index is a UTF-16 code-unit offset, since the frontend applies
-//     content.substring(0, edit_index) + edit_content. Treating it as a rune
-//     count spliced at the wrong position whenever non-BMP characters were
-//     present.
-//  2. The content field is a full replacement, not an append.
-//  3. Diffing accumulated text by byte length and slicing content[sentLen:]
-//     landed inside a multi-byte rune after any edit that changed the byte
-//     length, emitting invalid UTF-8 that renders as U+FFFD. Partial "<det"
-//     tag fragments leaked the same way.
+//  1. edit_index is a UTF-16 code-unit offset, because the frontend applies
+//     content.substring(0, edit_index) + edit_content. Treating it as a rune count
+//     spliced at the wrong position whenever non-BMP characters appeared.
+//  2. content is a full replacement, not an append.
+//  3. Diffing by byte length and slicing content[sentLen:] landed inside a
+//     multi-byte rune after any edit that changed the byte length, emitting
+//     invalid UTF-8 that renders as U+FFFD. Partial "<det" fragments leaked the
+//     same way.
 //
-// The tests feed synthetic streams shaped like the real upstream protocol
-// through the actual parser, replay the results through the handler logic, and
-// assert what an OpenAI-compatible client receives.
+// These feed synthetic streams shaped like the real protocol through the actual
+// parser, replay them through the handler logic, and assert what an
+// OpenAI-compatible client receives.
 
 package zbridge
 
@@ -27,20 +24,20 @@ import (
 	"unicode/utf8"
 )
 
-// sseEvent wraps one upstream payload as an SSE `data:` line.
+// sseEvent wraps one payload as an SSE `data:` line.
 func sseEvent(payload string) string {
 	return "data: " + payload + "\n\n"
 }
 
-// runSSEParser runs the real streamSSEResponse over a synthetic body and
-// collects every ZAIResult the channel receives.
+// runSSEParser drives the real streamSSEResponse over a synthetic body and
+// collects every ZAIResult.
 func runSSEParser(t *testing.T, body string) []ZAIResult {
 	t.Helper()
 	ch := make(chan ZAIResult, 4096)
 	errCh := make(chan error, 1)
 	go func() {
-		// sendToZAI closes the channel after sendToZAIStream returns;
-		// mirror that here so the drain loop terminates.
+		// sendToZAI closes the channel once sendToZAIStream returns; mirror that
+		// so the drain loop terminates.
 		errCh <- streamSSEResponse(context.Background(), strings.NewReader(body), ch)
 		close(ch)
 	}()
@@ -54,10 +51,8 @@ func runSSEParser(t *testing.T, body string) []ZAIResult {
 	return results
 }
 
-// replayClientView replicates VERBATIM the accumulation logic of
-// chatCompletionsHandler / anthropicStreamResponse after the issue #23
-// fix: the parser owns diffing, the handler forwards result.Chunk and
-// tracks the result.FullText snapshot.
+// replayClientView mirrors the handlers' accumulation exactly: the parser owns
+// diffing, the handler forwards result.Chunk and tracks the FullText snapshot.
 func replayClientView(results []ZAIResult) (clientText string, deltas []string) {
 	fullContent := ""
 	for _, result := range results {
@@ -78,9 +73,8 @@ func replayClientView(results []ZAIResult) (clientText string, deltas []string) 
 	return strings.Join(deltas, ""), deltas
 }
 
-// assertValidUTF8 fails the test if any client-visible delta contains
-// invalid UTF-8 (which json.Marshal would replace with U+FFFD — the
-// garbled characters reported in issue #23).
+// assertValidUTF8 fails if any client-visible delta holds invalid UTF-8, which
+// json.Marshal would turn into the U+FFFD garble from issue #23.
 func assertValidUTF8(t *testing.T, deltas []string) {
 	t.Helper()
 	for i, d := range deltas {
@@ -90,7 +84,7 @@ func assertValidUTF8(t *testing.T, deltas []string) {
 	}
 }
 
-// withHoldback runs fn with a temporary StreamHoldback value.
+// withHoldback runs fn under a temporary StreamHoldback.
 func withHoldback(t *testing.T, n int, fn func()) {
 	t.Helper()
 	old := config.StreamHoldback
@@ -99,7 +93,7 @@ func withHoldback(t *testing.T, n int, fn func()) {
 	fn()
 }
 
-// ── Baseline: pure delta_content append must stay clean ─────────────────────
+// Baseline: a pure delta_content append must stay clean.
 
 func TestSSEBaselinePureDeltaAppend(t *testing.T) {
 	body := sseEvent(`{"data":{"delta_content":"你好，"}}`) +
@@ -119,13 +113,10 @@ func TestSSEBaselinePureDeltaAppend(t *testing.T) {
 	}
 }
 
-// ── Issue #23 core repro: edit_content revision garbled the output ──────────
-//
-// Upstream streams "Hello 你好", then revises via edit_content from UTF-16
-// index 6 to "世界！". With hold-back disabled (worst case: the rewrite
-// touches text already forwarded to the client) the client must still
-// receive only valid UTF-8 — the old code sliced mid-rune here and
-// emitted raw continuation bytes.
+// The core repro. Upstream streams "Hello 你好", then revises from UTF-16 index 6
+// to "世界！". With hold-back disabled — worst case, the rewrite touches text
+// already forwarded — the client must still receive only valid UTF-8. The old code
+// sliced mid-rune here and emitted raw continuation bytes.
 
 func TestSSEEditContentRevisionNeverEmitsGarble(t *testing.T) {
 	body := sseEvent(`{"data":{"delta_content":"Hello 你好"}}`) +
@@ -137,17 +128,16 @@ func TestSSEEditContentRevisionNeverEmitsGarble(t *testing.T) {
 		results := runSSEParser(t, body)
 		clientText, deltas := replayClientView(results)
 		assertValidUTF8(t, deltas)
-		// The stale "你好" cannot be taken back from an append-only
-		// client, but the corrected tail must follow it intact.
+		// The stale "你好" cannot be taken back from an append-only client, but the
+		// corrected tail must follow it intact.
 		if !strings.HasSuffix(clientText, "世界！") {
 			t.Errorf("client text = %q, must end with the corrected tail %q", clientText, "世界！")
 		}
 	})
 }
 
-// With the default hold-back window the tail revision happens inside the
-// pending region, so the client must converge EXACTLY on the upstream's
-// final text — no stale fragment, no garble.
+// With the default window the revision lands inside the pending region, so the
+// client converges exactly on the upstream's final text: no stale fragment.
 func TestSSEEditContentRevisionAbsorbedByHoldback(t *testing.T) {
 	body := sseEvent(`{"data":{"delta_content":"Hello 你好"}}`) +
 		sseEvent(`{"data":{"edit_content":"世界！","edit_index":6}}`) +
@@ -165,13 +155,12 @@ func TestSSEEditContentRevisionAbsorbedByHoldback(t *testing.T) {
 	})
 }
 
-// ── Deep edit far beyond the hold-back window must stay readable ────────────
+// A deep edit far beyond the window must still stay readable.
 
 func TestSSEDeepEditStaysValidUTF8(t *testing.T) {
-	// 30 runes of Chinese (90 bytes), then the model backtracks to rune 2
-	// and retypes a LONGER passage (ASCII + Chinese mix, as real output
-	// contains markdown/spaces). The old byte-length diff sliced the new
-	// content at the old byte offset — inside a multi-byte rune.
+	// 30 Chinese runes (90 bytes), then a backtrack to rune 2 that retypes a
+	// longer ASCII/Chinese passage, as real output mixes markdown and spaces. The
+	// old byte-length diff sliced the new content at the old offset, mid-rune.
 	longPrefix := strings.Repeat("长", 30)
 	body := sseEvent(fmt.Sprintf(`{"data":{"delta_content":"%s"}}`, longPrefix)) +
 		sseEvent(`{"data":{"edit_content":"短文abc`+longPrefix+`","edit_index":2}}`) +
@@ -185,12 +174,10 @@ func TestSSEDeepEditStaysValidUTF8(t *testing.T) {
 	})
 }
 
-// ── <details> reasoning tag split across SSE events ─────────────────────────
-//
-// The upstream streams the "<details" opener one fragment at a time. The
-// old parser emitted the partial "<det" fragment as content, then sliced
-// mid-rune when the tag completed and content shrank back — the exact
-// "穿插着一些无法查看的乱码" pattern from the issue report.
+// A <details> tag split across events. Upstream streams the opener a fragment at a
+// time; the old parser emitted the partial "<det" as content, then sliced mid-rune
+// when the tag completed and content shrank back — exactly the
+// "穿插着一些无法查看的乱码" pattern from the report.
 
 func TestSSEDetailsTagSplitAcrossEvents(t *testing.T) {
 	body := sseEvent(`{"data":{"delta_content":"答案"}}`) +
@@ -214,7 +201,7 @@ func TestSSEDetailsTagSplitAcrossEvents(t *testing.T) {
 				t.Errorf("holdback=%d: client text = %q, want %q", hb, clientText, want)
 			}
 
-			// Reasoning must still arrive intact on the reasoning channel.
+			// Reasoning must still arrive intact on its own channel.
 			reasoning := ""
 			for _, r := range results {
 				reasoning += r.Reasoning
@@ -226,24 +213,20 @@ func TestSSEDetailsTagSplitAcrossEvents(t *testing.T) {
 	}
 }
 
-// ── edit_index is UTF-16, not runes (owner's hypothesis, confirmed) ─────────
-//
-// The official frontend does content.substring(0, edit_index) — UTF-16
-// code units. "A🙂" is 2 runes but 3 UTF-16 units; an edit right after
-// the emoji arrives with edit_index=3. The old rune-based conversion
-// spliced one character too late and silently corrupted the text.
+// edit_index counts UTF-16 units, not runes. "A🙂" is 2 runes but 3 units, so an
+// edit right after the emoji arrives as edit_index=3. The old rune-based conversion
+// spliced one character late and silently corrupted the text.
 
 func TestSSEEditIndexIsUTF16Units(t *testing.T) {
 	body := sseEvent(`{"data":{"delta_content":"A🙂B"}}`) +
-		// UTF-16 index 3 = after "A" (1 unit) + "🙂" (2 units)
+		// Index 3 lands after "A" (1 unit) plus "🙂" (2 units).
 		sseEvent(`{"data":{"edit_content":"C","edit_index":3}}`) +
 		sseEvent(`{"data":{"phase":"done"}}`) +
 		"data: [DONE]\n\n"
 
-	// Hold-back absorbs the tail rewrite, so the client must converge
-	// exactly. Under the old rune-based conversion edit_index=3 spliced
-	// AFTER the "B" (3 runes), appending instead of replacing — the
-	// client would have seen "A🙂BC".
+	// Hold-back absorbs the rewrite, so the client converges exactly. The old
+	// conversion put index 3 after the "B" (3 runes) and appended instead of
+	// replacing, so the client saw "A🙂BC".
 	withHoldback(t, 24, func() {
 		results := runSSEParser(t, body)
 		clientText, deltas := replayClientView(results)
@@ -255,14 +238,14 @@ func TestSSEEditIndexIsUTF16Units(t *testing.T) {
 	})
 }
 
-// Pure-BMP text: UTF-16 units == runes, must keep working.
+// Pure BMP text, where units and runes coincide, must keep working.
 func TestSSEEditIndexBMPText(t *testing.T) {
 	body := sseEvent(`{"data":{"delta_content":"你好世界"}}`) +
 		sseEvent(`{"data":{"edit_content":"地球","edit_index":2}}`) +
 		sseEvent(`{"data":{"phase":"done"}}`) +
 		"data: [DONE]\n\n"
 
-	// Hold-back absorbs the tail rewrite: the client must converge exactly.
+	// Hold-back absorbs the rewrite, so the client converges exactly.
 	withHoldback(t, 24, func() {
 		results := runSSEParser(t, body)
 		clientText, deltas := replayClientView(results)
@@ -274,11 +257,9 @@ func TestSSEEditIndexBMPText(t *testing.T) {
 	})
 }
 
-// ── `content` events are full replacements, not appends ─────────────────────
-//
-// Official frontend: `lt.content = rr` ("全量更新"). The old parser
-// appended `content` events, duplicating the whole message whenever the
-// upstream sent a snapshot.
+// content events are full replacements, not appends: the frontend does
+// lt.content = rr ("全量更新"). The old parser appended them, duplicating the whole
+// message whenever upstream sent a snapshot.
 
 func TestSSEContentFieldIsFullReplacement(t *testing.T) {
 	body := sseEvent(`{"data":{"delta_content":"partial text"}}`) +
@@ -286,9 +267,8 @@ func TestSSEContentFieldIsFullReplacement(t *testing.T) {
 		sseEvent(`{"data":{"phase":"done"}}`) +
 		"data: [DONE]\n\n"
 
-	// Hold-back keeps "partial text" pending, so the replacement happens
-	// before anything reaches the client: it must see ONLY the snapshot.
-	// (The old parser APPENDED the snapshot, duplicating everything.)
+	// Hold-back keeps "partial text" pending, so the replacement lands before
+	// anything reaches the client: it must see only the snapshot.
 	withHoldback(t, 24, func() {
 		results := runSSEParser(t, body)
 		clientText, deltas := replayClientView(results)
@@ -302,22 +282,18 @@ func TestSSEContentFieldIsFullReplacement(t *testing.T) {
 	})
 }
 
-// ── Long stream with interleaved edits: parser contract holds ───────────────
-//
-// A realistic-length stream (well past the hold-back window) with mixed
-// Chinese/ASCII/emoji and periodic tail edits. Every chunk reaching the
-// client must be valid UTF-8, FullText snapshots must equal the running
-// concatenation of chunks, and the final text must match upstream.
+// A realistic-length stream, well past the window, mixing Chinese, ASCII and emoji
+// with periodic tail edits. Every chunk must be valid UTF-8, every FullText must
+// equal the running concatenation, and the final text must match upstream.
 
 func TestSSELongStreamWithTailEditsContract(t *testing.T) {
 	var b strings.Builder
-	// 40 events of mixed text, then a tail edit inside the hold-back zone.
+	// 40 events of mixed text, then a tail edit inside the window.
 	for i := 0; i < 40; i++ {
 		b.WriteString(sseEvent(fmt.Sprintf(`{"data":{"delta_content":"第%d段。"}}`, i)))
 	}
-	// Tail backtrack: replace the last two events' text (within the 24-rune
-	// hold-back zone). Segments 0-9 are 4 runes, 10-37 are 5 runes each:
-	// 10×4 + 28×5 = 180 UTF-16 units before segments 38-39.
+	// Replace the last two events' text, inside the 24-rune window. Segments 0-9
+	// are 4 runes and 10-37 are 5, so 10×4 + 28×5 = 180 units precede 38-39.
 	b.WriteString(sseEvent(`{"data":{"edit_content":"最终段。","edit_index":180}}`))
 	b.WriteString(sseEvent(`{"data":{"delta_content":"收尾 🙂"}}`))
 	b.WriteString(sseEvent(`{"data":{"phase":"done"}}`))
@@ -329,9 +305,8 @@ func TestSSELongStreamWithTailEditsContract(t *testing.T) {
 
 		assertValidUTF8(t, deltas)
 
-		// Parser contract: every emitted chunk must be a suffix of its
-		// FullText snapshot (never a mid-string slice), and the final
-		// snapshot must equal the upstream's final content.
+		// The contract: every chunk is a suffix of its FullText snapshot, never a
+		// mid-string slice, and the last snapshot equals upstream's final content.
 		for i, r := range results {
 			if r.Reasoning != "" || r.Chunk == "" {
 				continue
@@ -361,7 +336,7 @@ func TestSSELongStreamWithTailEditsContract(t *testing.T) {
 	})
 }
 
-// ── Unit tests for the helper functions ─────────────────────────────────────
+// Unit tests for the helpers.
 
 func TestUTF16IndexToByteIndex(t *testing.T) {
 	cases := []struct {
@@ -388,7 +363,7 @@ func TestUTF16IndexToByteIndex(t *testing.T) {
 		if got := utf16IndexToByteIndex(c.s, c.idx); got != c.want {
 			t.Errorf("utf16IndexToByteIndex(%q, %d) = %d, want %d", c.s, c.idx, got, c.want)
 		}
-		// The result must always be a rune boundary.
+		// The result must always land on a rune boundary.
 		got := utf16IndexToByteIndex(c.s, c.idx)
 		if got < len(c.s) && !utf8.RuneStart(c.s[got]) {
 			t.Errorf("utf16IndexToByteIndex(%q, %d) = %d lands mid-rune", c.s, c.idx, got)
@@ -416,7 +391,7 @@ func TestCommonPrefixLenRuneSafe(t *testing.T) {
 }
 
 func TestSSEEmitterDelta(t *testing.T) {
-	// Normal growth.
+	// Plain growth emits the new suffix.
 	e := &sseEmitter{}
 	if got := e.delta("abc"); got != "abc" {
 		t.Errorf("growth from empty: got %q, want %q", got, "abc")
@@ -428,7 +403,7 @@ func TestSSEEmitterDelta(t *testing.T) {
 		t.Errorf("no-op: got %q, want empty", got)
 	}
 
-	// Multibyte growth stays rune-aligned.
+	// Multibyte growth stays rune-aligned too.
 	e2 := &sseEmitter{}
 	if got := e2.delta("你好"); got != "你好" {
 		t.Errorf("multibyte growth: got %q", got)
@@ -437,9 +412,9 @@ func TestSSEEmitterDelta(t *testing.T) {
 		t.Errorf("multibyte growth delta: got %q, want %q", got, "世界")
 	}
 
-	// Deep truncation: target is a prefix of the client view — nothing is
-	// sent and the view is NOT rewound, so the following growth does not
-	// re-emit text the client already has.
+	// Deep truncation, where target is a prefix of the view: nothing is sent and
+	// the view is not rewound, so later growth does not re-emit what the client
+	// already has.
 	e3 := &sseEmitter{}
 	e3.delta("你好世界天地")
 	if got := e3.delta("你好世界"); got != "" {
@@ -449,7 +424,7 @@ func TestSSEEmitterDelta(t *testing.T) {
 		t.Errorf("growth after shrink: got %q, want %q", got, "人")
 	}
 
-	// Rewrite inside the view: re-sync from the common prefix, valid UTF-8.
+	// A rewrite inside the view re-syncs from the common prefix, still valid UTF-8.
 	e4 := &sseEmitter{}
 	e4.delta("Hello 你好")
 	got := e4.delta("Hello 世界！")
@@ -460,7 +435,7 @@ func TestSSEEmitterDelta(t *testing.T) {
 		t.Errorf("rewrite re-sync produced invalid UTF-8: %q", got)
 	}
 
-	// Full rewrite.
+	// A full rewrite shares no prefix at all.
 	e5 := &sseEmitter{}
 	e5.delta("abc")
 	if got := e5.delta("xyz"); got != "xyz" {
@@ -522,19 +497,18 @@ func TestSplitDetails(t *testing.T) {
 		{"plain text", "", "plain text"},
 		{"<details>think</details>answer", "think", "answer"},
 		{"before<details>think</details>after", "think", "beforeafter"},
-		// A partial tag FRAGMENT ("<det") passes through splitDetails —
-		// it is held back at the emission layer (holdBackPartialDetailsTag)
-		// while streaming and only released as literal text by the final
-		// flush if the stream really ends there.
+		// A fragment like "<det" passes through splitDetails; the emission layer
+		// holds it back while streaming and only releases it as literal text on
+		// the final flush, if the stream really ends there.
 		{"answer<det", "", "answer<det"},
-		// Complete opener literal without '>' yet: held pending entirely.
+		// A complete opener with no '>' yet is held pending entirely.
 		{"answer<details", "", "answer"},
 		{"answer<details sty", "", "answer"},
-		// opener complete, reasoning still streaming
+		// Opener complete, reasoning still streaming.
 		{"a<details>thinking so far", "thinking so far", "a"},
-		// multiple blocks
+		// Several blocks concatenate into one reasoning body.
 		{"<details>t1</details>x<details>t2</details>y", "t1t2", "xy"},
-		// attributes on the opener
+		// Attributes on the opener must not break the match.
 		{"<details type=\"thinking\">t</details>ans", "t", "ans"},
 	}
 	for _, c := range cases {

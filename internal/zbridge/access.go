@@ -4,18 +4,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"zai-api/internal/ansi"
 )
 
-// ============================================================================
-// ACCESS LOG
-// ============================================================================
-//
-// One line per request on the console, so a busy terminal stays readable. The
-// per-chunk and per-session detail behind each line is still recorded in the log
-// file at info or debug level.
+// One console line per request, so a busy terminal stays readable. The per-chunk
+// detail behind each line still reaches the log file at info or debug level.
 
-// accessRecord accumulates what the summary line reports. Handlers create one on
-// entry and call done exactly once, via defer, so every exit path is covered.
+// accessRecord accumulates the summary line. Handlers create one on entry and
+// defer done, so every exit path is covered.
 type accessRecord struct {
 	started  time.Time
 	method   string
@@ -23,7 +20,7 @@ type accessRecord struct {
 	model    string
 	stream   bool
 	status   int
-	outcome  string // "" once finished normally, otherwise a short reason
+	outcome  string // "" when normal, else a short reason
 	bytesOut int64
 	chunks   int
 	reported bool
@@ -43,49 +40,63 @@ func (a *accessRecord) fail(status int, reason string) {
 	a.outcome = reason
 }
 
-// done emits the summary. Safe to call more than once; only the first wins.
+// done emits the summary; only the first call wins.
 func (a *accessRecord) done() {
 	if a == nil || a.reported {
 		return
 	}
 	a.reported = true
 
+	// Labels greyed, values bright: the eye lands on model, status and timing.
 	var b strings.Builder
-	b.Grow(160)
-	b.WriteString(a.method)
+	b.Grow(256)
+	b.WriteString(ansi.Bold(ansi.Violet(printableASCII(a.method))))
 	b.WriteByte(' ')
-	b.WriteString(a.path)
+	b.WriteString(printableASCII(a.path))
 
 	if a.model != "" {
-		b.WriteString(" model=")
-		b.WriteString(a.model)
+		b.WriteString(ansi.Grey(" model="))
+		b.WriteString(ansi.Cyan(printableASCII(a.model)))
 	}
 	if a.stream {
-		b.WriteString(" stream")
+		b.WriteString(ansi.Grey(" stream"))
 	}
 
+	paint := statusColour(a.status)
 	b.WriteByte(' ')
-	b.WriteString(strconv.Itoa(a.status))
+	b.WriteString(ansi.Bold(paint(strconv.Itoa(a.status))))
 
 	elapsed := time.Since(a.started)
-	b.WriteString(" in ")
+	b.WriteString(ansi.Grey(" in "))
 	b.WriteString(formatDuration(elapsed))
 
 	if a.chunks > 0 {
-		b.WriteString(" chunks=")
+		b.WriteString(ansi.Grey(" chunks="))
 		b.WriteString(strconv.Itoa(a.chunks))
 	}
 	if a.bytesOut > 0 {
-		b.WriteString(" out=")
+		b.WriteString(ansi.Grey(" out="))
 		b.WriteString(formatBytes(a.bytesOut))
 	}
 	if a.outcome != "" {
-		b.WriteString(" (")
-		b.WriteString(a.outcome)
-		b.WriteByte(')')
+		b.WriteByte(' ')
+		b.WriteString(paint("(" + printableASCII(a.outcome) + ")"))
 	}
 
 	logConsolef("%s", b.String())
+}
+
+func statusColour(status int) func(string) string {
+	switch {
+	case status >= 500:
+		return ansi.Red
+	case status >= 400:
+		return ansi.Yellow
+	case status >= 200 && status < 300:
+		return ansi.Green
+	default:
+		return ansi.Cyan
+	}
 }
 
 func formatDuration(d time.Duration) string {

@@ -1,14 +1,12 @@
-// Blackbox end-to-end regression test for issue #23 through the REAL HTTP
 // Blackbox tests over the full HTTP stack, driven through zbridge.NewHandler:
 //
 //	NewHandler -> authMiddleware -> chatCompletionsHandler -> sendToZAI ->
 //	sendToZAIStream -> streamSSEResponse -> OpenAI SSE chunks on the wire.
 //
-// Only the Z.AI upstream is mocked. Captcha is bypassed with a pre-seeded
-// agent-mode cache, and BASE_URL points at the mock. The mock stream carries
-// every pathological shape from the issue report: multibyte Chinese text, an
-// edit_content tail revision, and a <details> tag streamed character by
-// character.
+// Only the upstream is mocked; captcha is bypassed with a pre-seeded agent-mode
+// cache and BASE_URL points at the mock. The stream carries every pathological
+// shape from issue #23: multibyte Chinese, an edit_content tail revision, and a
+// <details> tag streamed character by character.
 
 package tests
 
@@ -28,7 +26,7 @@ import (
 func TestHTTPEndToEndGarbleFix(t *testing.T) {
 	longPrefix := strings.Repeat("长", 30)
 
-	// ── Mock Z.AI upstream ────────────────────────────────────────────────
+	// Mock upstream.
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v2/chat/completions" {
 			http.NotFound(w, r)
@@ -42,9 +40,8 @@ func TestHTTPEndToEndGarbleFix(t *testing.T) {
 			`{"data":{"delta_content":"ails>让我想想。</details>"}}`,
 			`{"data":{"delta_content":"答案是："}}`,
 			`{"data":{"delta_content":"42。"}}`,
-			// Tail revision: replace "42。". edit_index counts the RAW
-			// accumulated text (frontend: lt.content.substring(0, i)),
-			// which INCLUDES the <details> block:
+			// Tail revision replacing "42。". edit_index counts the raw
+			// accumulated text, the <details> block included:
 			//   30 (长×30) + 9 ("<details>") + 5 ("让我想想。")
 			//   + 10 ("</details>") + 4 ("答案是：") = 58
 			`{"data":{"edit_content":"四十二！","edit_index":58}}`,
@@ -64,15 +61,15 @@ func TestHTTPEndToEndGarbleFix(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	// ── Point the bridge at the mock ──────────────────────────────────────
+	// Point the bridge at it.
 	oldBase := zbridge.BASE_URL
 	zbridge.BASE_URL = upstream.URL
 	defer func() { zbridge.BASE_URL = oldBase }()
 
-	// ── Pre-seed session (skip real guest auth) ───────────────────────────
+	// Pre-seed the session, skipping real guest auth.
 	defer zbridge.OverrideSessionState("test-token", "test-user", true)()
 
-	// ── Bypass captcha via the agent-mode cache ───────────────────────────
+	// Bypass captcha through the agent-mode cache.
 	cfg := zbridge.GetConfig()
 	oldAgentMode, oldHoldback := cfg.AgentMode, cfg.StreamHoldback
 	cfg.AgentMode = true
@@ -80,11 +77,11 @@ func TestHTTPEndToEndGarbleFix(t *testing.T) {
 	defer func() { cfg.AgentMode, cfg.StreamHoldback = oldAgentMode, oldHoldback }()
 	zbridge.SeedCaptchaParam("test-captcha-param")
 
-	// ── Drive the real handler through the full HTTP surface ─────────────
+	// Drive the real handler over the full HTTP surface.
 	body := `{"model":"glm-4.7","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cfg.Auth.Token)
+	req.Header.Set("Authorization", "Bearer "+cfg.Auth.Tokens[0])
 	rec := httptest.NewRecorder()
 	zbridge.NewHandler().ServeHTTP(rec, req)
 
@@ -92,7 +89,7 @@ func TestHTTPEndToEndGarbleFix(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 
-	// ── Parse the OpenAI SSE the client received over the wire ────────────
+	// Parse what the client actually received.
 	clientText := ""
 	reasoning := ""
 	contentChunks := 0
@@ -149,7 +146,6 @@ func TestHTTPEndToEndGarbleFix(t *testing.T) {
 		t.Errorf("reasoning = %q, want %q", reasoning, "让我想想。")
 	}
 
-	// Keep the test from racing the fire-and-forget session GC against the
-	// deferred BASE_URL restore.
+	// Stops the fire-and-forget session GC racing the deferred BASE_URL restore.
 	time.Sleep(50 * time.Millisecond)
 }

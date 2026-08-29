@@ -6,27 +6,24 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"zai-api/internal/ansi"
 )
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-
 const (
-	// Aliyun captcha credentials
+	// Aliyun captcha credentials.
 	accessKey       = "LTAI5tSEBwYMwVKAQGpxmvTd"
 	secretKey       = "YSKfst7GaVkXwZYvVihJsKF9r89koz"
 	sceneID         = "didk33e0"
 	maxTokenRetries = 5
 
-	// Z.AI direct config
+	// Z.AI wire constants.
 	SALT_KEY           = "key-@@@@)))()((9))-xxxx&&&%%%%%"
 	DEFAULT_FE_VERSION = "prod-fe-1.1.88"
 	zaiUserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-// BASE_URL is a var (not const) only so tests can point the bridge at a
-// mock upstream; the default value is the production endpoint.
+// A var, not a const, only so tests can point at a mock upstream.
 var BASE_URL = "https://chat.z.ai"
 
 type Config struct {
@@ -36,38 +33,37 @@ type Config struct {
 	}
 	Auth struct {
 		Enabled bool
-		Token   string
+		// Accepted API keys. A client's key must match one of these. AUTH_TOKEN may
+		// list several, comma-separated.
+		Tokens []string
 	}
 	Timeouts struct {
 		Default int
 	}
 	ZaiToken  string
 	AgentMode bool
-	// AgentModeVariant picks the compatibility shim: "modern" (XML-sectioned
-	// prompt, see agent.go) or "legacy" ([ROLE: ...] rewrite).
+	// Which shim: "modern" (XML-sectioned prompt, agent.go) or "legacy"
+	// ([ROLE: ...] rewrite, agent_legacy.go).
 	AgentModeVariant string
 	Logging          struct {
 		Level  string // LOG_LEVEL: debug, info, warn, error, off
 		Format string // LOG_FORMAT
 		Dir    string // LOG_DIR, default "logs"
-		// ConsoleWidth truncates console lines; the file keeps them in full.
+		// Truncates console lines only; the file keeps them in full.
 		ConsoleWidth int // LOG_CONSOLE_WIDTH, default 150
-		// Retention bounds. Rotation is size-triggered only; lumberjack has
-		// no timer, so there is no time-based rotation.
+		// Retention. Rotation is size-triggered only: lumberjack has no timer.
 		MaxSizeMB   int // LOG_MAX_SIZE_MB, default 10
 		MaxBackups  int // LOG_MAX_BACKUPS, default 7
 		MaxAgeDays  int // LOG_MAX_AGE_DAYS, default 7
 		FlushMillis int // LOG_FLUSH_MS, default 500
 	}
 	MaxRequestBytes int64 // MAX_REQUEST_BYTES, default 32 MiB
-	// UpstreamMaxConns bounds concurrent connections to Z.AI. The uTLS dialer
-	// advertises HTTP/1.1 only, since HTTP/2 would change the fingerprint, so
-	// one connection carries one in-flight stream and this is the real ceiling
-	// on concurrent completions.
+	// The uTLS dialer advertises HTTP/1.1 only (HTTP/2 would change the
+	// fingerprint), so one connection carries one stream and this is the real
+	// ceiling on concurrent completions.
 	UpstreamMaxConns int // UPSTREAM_MAX_CONNS, default 128
-	// Captcha tunes the parameter cache. Every cached parameter costs one
-	// device token and expires unused, so depth and idle window set the idle
-	// token burn.
+	// Every cached parameter costs a device token and expires unused, so depth
+	// and idle window set the idle token burn.
 	Captcha struct {
 		CacheSize    int           // CAPTCHA_CACHE_SIZE, default 2
 		TTL          time.Duration // CAPTCHA_TTL_SECONDS, default 75
@@ -82,24 +78,21 @@ type Config struct {
 		CollectorPath string        // TOKEN_COLLECTOR_PATH, default auto-detected
 		RunTimeout    time.Duration // TOKEN_COLLECT_TIMEOUT_SECONDS, default 900
 	}
-	// StreamHoldback is how many runes are kept pending at the tail of the
-	// streamed content. Z.AI's stream is edit-based (edit_content can rewrite
-	// the tail) and an append-only SSE client cannot take back text it already
-	// received, so a small window lets ordinary backtracks be absorbed
-	// invisibly. 0 disables it. See issue #23.
+	// Runes held pending at the tail of streamed content. Z.AI's stream is
+	// edit-based and an append-only SSE client cannot take text back, so a small
+	// window absorbs ordinary backtracks invisibly. 0 disables. See issue #23.
 	StreamHoldback int
-	// SyncMode creates a chat session per request instead of drawing from the
-	// pool. Sessions are throwaway either way — see session_pool.go.
+	// Create a session per request instead of drawing from the pool; throwaway
+	// either way, see session_pool.go.
 	SyncMode bool
-	// SessionPoolSize is the standing batch of pre-made ready chat sessions.
+	// Standing batch of pre-made ready chat sessions.
 	SessionPoolSize int // SESSION_POOL_SIZE, default 5
-	// SessionAcquireTimeout bounds, in seconds, how long a request waits for a
-	// pooled session before creating one directly. 0 waits indefinitely.
+	// Seconds a request waits for a pooled session before minting one directly;
+	// 0 waits indefinitely.
 	SessionAcquireTimeout int // SESSION_ACQUIRE_TIMEOUT, default 10
 }
 
-// envInt overwrites dst from the named environment variable when it holds an
-// integer of at least min.
+// envInt overwrites dst when the named variable holds an integer >= min.
 func envInt(key string, dst *int, min int) {
 	v := os.Getenv(key)
 	if v == "" {
@@ -110,8 +103,18 @@ func envInt(key string, dst *int, min int) {
 	}
 }
 
-// envSeconds overwrites dst from the named environment variable, interpreting
-// the value as a whole number of seconds of at least minSeconds.
+// parseAuthTokens splits a comma-separated AUTH_TOKEN into trimmed, non-empty keys.
+func parseAuthTokens(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if t := strings.TrimSpace(part); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// envSeconds is envInt reading whole seconds into a Duration.
 func envSeconds(key string, dst *time.Duration, minSeconds int) {
 	v := os.Getenv(key)
 	if v == "" {
@@ -132,9 +135,8 @@ func envBool(v string, fallback bool) bool {
 	return fallback
 }
 
-// loadDotEnv reads simple KEY=VALUE lines from an .env file and exports each
-// key that is not already set in the real environment, so an explicit env var
-// or `-e` flag always wins over the file. Missing files are ignored.
+// loadDotEnv exports KEY=VALUE lines that are not already set, so a real env var
+// always beats the file. Missing files are ignored.
 func loadDotEnv(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -166,14 +168,12 @@ func loadDotEnv(path string) {
 	}
 }
 
-// loadDotEnvFiles seeds the environment from .env, checked both in the working
-// directory and next to the executable. This is what lets the packaged exe run
-// without the PowerShell wrapper: double-clicked, tray-launched, or as a
-// service, it finds its own configuration. The working directory is preferred
-// so an operator can override the baked file by launching elsewhere.
+// loadDotEnvFiles seeds the environment from .env in the working directory and
+// next to the executable, which is what lets the packaged exe run unwrapped:
+// double-clicked, tray-launched or as a service, it finds its own config.
 func loadDotEnvFiles() {
-	// First writer wins (see loadDotEnv), so the preferred source is loaded
-	// first: the working directory, then the executable's own directory.
+	// First writer wins, so load the preferred source first: the working
+	// directory, then the executable's own.
 	if wd, err := os.Getwd(); err == nil {
 		loadDotEnv(filepath.Join(wd, ".env"))
 	}
@@ -187,16 +187,15 @@ func loadConfig() *Config {
 
 	c := &Config{}
 	c.Server.Port = 3007
-	c.Server.Host = "0.0.0.0"
+	c.Server.Host = "127.0.0.1"
 	c.Auth.Enabled = true
-	c.Auth.Token = "Jubin"
+	c.Auth.Tokens = append([]string(nil), defaultAuthTokens...)
 	c.Timeouts.Default = 300000
 	c.ZaiToken = ""
 	c.AgentMode = false
 	c.AgentModeVariant = "modern"
-	// Not debug: at that level every upstream SSE line plus full request and
-	// response bodies are logged, putting a mutex, a file write and a console
-	// syscall on the hottest path in the process.
+	// Not debug: that logs every SSE line and full bodies, putting a mutex, a
+	// file write and a console syscall on the hottest path in the process.
 	c.Logging.Level = "info"
 	c.Logging.Format = "text"
 	c.Logging.Dir = "logs"
@@ -230,7 +229,9 @@ func loadConfig() *Config {
 		c.Server.Host = h
 	}
 	if t := os.Getenv("AUTH_TOKEN"); t != "" {
-		c.Auth.Token = t
+		if toks := parseAuthTokens(t); len(toks) > 0 {
+			c.Auth.Tokens = toks
+		}
 	}
 	if t := os.Getenv("TIMEOUT"); t != "" {
 		if n, err := strconv.Atoi(t); err == nil {
@@ -245,14 +246,14 @@ func loadConfig() *Config {
 		case "1", "true", "yes", "on", "modern":
 			c.AgentMode = true
 		case "legacy":
-			// Explicit opt-in to the old [ROLE: ...] rewrite shim.
+			// Opt in to the old [ROLE: ...] shim.
 			c.AgentMode = true
 			c.AgentModeVariant = "legacy"
 		case "0", "false", "no", "off":
 			c.AgentMode = false
 		}
 	}
-	// Overrides the shim independently of the AGENT_MODE on/off switch.
+	// Picks the shim independently of the AGENT_MODE on/off switch.
 	if v := os.Getenv("AGENT_MODE_VARIANT"); v != "" {
 		switch strings.ToLower(v) {
 		case "legacy":
@@ -318,15 +319,17 @@ func loadConfig() *Config {
 var config = func() *Config {
 	c := loadConfig()
 	setLogLevel(c.Logging.Level)
+	// loadConfig has only just exported .env; ansi read the environment at init.
+	ansi.Refresh()
 	return c
 }()
 
-// agentModern reports whether the modern shim (agent.go) is active.
+// agentModern reports whether the modern shim is active.
 func (c *Config) agentModern() bool {
 	return c.AgentMode && !strings.EqualFold(c.AgentModeVariant, "legacy")
 }
 
-// agentLegacy reports whether the legacy shim (agent_legacy.go) is active.
+// agentLegacy reports whether the legacy shim is active.
 func (c *Config) agentLegacy() bool {
 	return c.AgentMode && strings.EqualFold(c.AgentModeVariant, "legacy")
 }

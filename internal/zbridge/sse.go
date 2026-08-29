@@ -9,17 +9,12 @@ import (
 	"time"
 )
 
-// ============================================================================
-// SSE WRITER
-// ============================================================================
-
 var sseBufPool = sync.Pool{
 	New: func() interface{} { return bytes.NewBuffer(make([]byte, 0, 4096)) },
 }
 
-// sseWriter serialises event writes to one client and renders each event into
-// a pooled buffer, so a chunk costs one write syscall and no intermediate
-// string.
+// sseWriter serialises writes to one client and renders each event into a pooled
+// buffer, so a chunk costs one syscall and no intermediate string.
 type sseWriter struct {
 	mu      sync.Mutex
 	w       io.Writer
@@ -33,7 +28,7 @@ func newSSEWriter(w http.ResponseWriter) *sseWriter {
 	return &sseWriter{w: w, flusher: f}
 }
 
-// data writes an unnamed `data:` event carrying v as JSON.
+// data writes an unnamed `data:` event carrying v as JSON (the OpenAI form).
 func (s *sseWriter) data(v interface{}) {
 	buf := sseBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -42,11 +37,11 @@ func (s *sseWriter) data(v interface{}) {
 		sseBufPool.Put(buf)
 		return
 	}
-	buf.WriteByte('\n') // Encode already wrote the first newline
+	buf.WriteByte('\n') // Encode wrote the first newline already
 	s.flush(buf)
 }
 
-// event writes a named event, the form the Anthropic protocol uses.
+// event writes a named event, which is the Anthropic form.
 func (s *sseWriter) event(name string, v interface{}) {
 	buf := sseBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -61,7 +56,7 @@ func (s *sseWriter) event(name string, v interface{}) {
 	s.flush(buf)
 }
 
-// raw writes an already-rendered payload such as the [DONE] sentinel.
+// raw writes a pre-rendered payload, such as the [DONE] sentinel.
 func (s *sseWriter) raw(payload string) {
 	buf := sseBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -84,17 +79,12 @@ func (s *sseWriter) flush(buf *bytes.Buffer) {
 	sseBufPool.Put(buf)
 }
 
-// written reports the bytes and event count sent to this client, for the
-// one-line access summary.
+// written reports bytes and event count for the access summary line.
 func (s *sseWriter) written() (int64, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.bytes, s.events
 }
-
-// ============================================================================
-// OPENAI WIRE TYPES
-// ============================================================================
 
 // Pointer fields distinguish "absent" from "empty": a content delta must carry
 // "content":"" while a reasoning delta must not carry a content key at all.
@@ -157,9 +147,8 @@ func oaToolCallDelta(model, requestID string, call map[string]interface{}) oaChu
 	return newOAChunk(model, requestID, &oaDelta{ToolCalls: []interface{}{call}}, nil)
 }
 
-// oaRoleInit is the opening chunk of a stream. OpenAI announces the assistant
-// role in the first delta, and strict clients (TRAE among them) use it to open
-// the message before any content or tool_call arrives.
+// oaRoleInit opens a stream. OpenAI announces the assistant role in the first
+// delta, and strict clients (TRAE included) need it before any content arrives.
 func oaRoleInit(model, requestID string) oaChunk {
 	return newOAChunk(model, requestID, &oaDelta{Role: "assistant"}, nil)
 }

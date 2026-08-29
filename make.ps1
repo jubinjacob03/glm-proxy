@@ -34,6 +34,16 @@ if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
 
 $ldflags = '-s -w'
 
+# The installer script is the single source of truth for the version; the tray
+# needs it compiled in so auto-update can compare against GitHub releases.
+function Get-AppVersion {
+    $nsi = Join-Path $root 'installer\installer.nsi'
+    if (-not (Test-Path $nsi)) { return '0.0.0' }
+    $m = [regex]::Match((Get-Content $nsi -Raw), '!define\s+APP_VERSION\s+"([^"]+)"')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return '0.0.0'
+}
+
 function Invoke-GoBuild {
     param([string]$Output, [string]$Package, [string]$ExtraLd = '')
     Write-Host "  building $([System.IO.Path]::GetFileName($Output))" -ForegroundColor DarkGray
@@ -157,13 +167,16 @@ function Invoke-Installer {
     Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force -Path $staging, $out | Out-Null
 
+    $version = Get-AppVersion
     Push-Location $root
     try {
-        Write-Host 'Building binaries...' -ForegroundColor Cyan
+        Write-Host "Building binaries (version $version)..." -ForegroundColor Cyan
         Invoke-GoBuild -Output (Join-Path $staging 'zai-api.exe') -Package '.'
         Invoke-GoBuild -Output (Join-Path $staging 'token-collector.exe') -Package './cmd/token-collector'
         # -H=windowsgui: the tray runs with no console window of its own.
-        Invoke-GoBuild -Output (Join-Path $staging 'glm-tray.exe') -Package './cmd/glm-tray' -ExtraLd '-H=windowsgui'
+        # -X main.appVersion: lets auto-update compare against GitHub releases.
+        Invoke-GoBuild -Output (Join-Path $staging 'glm-tray.exe') -Package './cmd/glm-tray' `
+            -ExtraLd "-H=windowsgui -X main.appVersion=$version"
     }
     finally { Pop-Location }
 

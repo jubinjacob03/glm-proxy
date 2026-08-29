@@ -17,9 +17,10 @@ services:
     ports:
       - "3007:3007"
 
-    # Configuration is baked into the image at build time. Anything set here
-    # overrides the baked value, which is the escape hatch for rotating a token
-    # without a rebuild.
+    # Config comes from .env at run time, not baked into the image, so a rebuild is
+    # never needed to rotate a token and no secret lands in an image layer.
+    env_file:
+      - .env
     environment:
       HOST: 0.0.0.0
       PORT: 3007

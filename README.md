@@ -1,13 +1,13 @@
 # GLM Bridge — Z.AI Proxy API
 
-An OpenAI- **and Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z.ai). Drop it in front of any OpenAI- or Anthropic-compatible tool and start using Z.AI's GLM models without browser automation or complex setup at runtime.
+An **OpenAI** and **Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z.ai). Drop it in front of any OpenAI- or Anthropic-compatible tool and start using Z.AI's GLM models without browser automation or complex setup at runtime.
 
 ---
 
 ## Features
 
 - **Dual protocol** — OpenAI `/v1/chat/completions` + Anthropic `/v1/messages` on the same server
-- **Pure HTTP** — No Playwright, no Selenium, no browser overhead at runtime
+- **No browser on the request path** — completions are pure HTTP; a headless Chromium runs only periodically, in the background, to replenish device tokens when the store runs low
 - **Throwaway chat sessions (context-rot guard)** — Every stateless request runs on a chat session that is **deleted on Z.AI the moment its response is fully processed** (`DELETE /api/v1/chats/{chat_id}`), so no server-side history outlives a request and the account never accumulates dead sessions
 - **Async session pool (default)** — A standing batch of pre-made sessions (`SESSION_POOL_SIZE`, default 5) is kept ready at all times; requests grab one instantly, and each consumed session is deleted upstream + replaced immediately, so the batch refills itself while the app runs. `--sync-mode` / `SYNC_MODE=true` restores the legacy per-request flow (still garbage-collected)
 - **Graceful shutdown** — CTRL+C / SIGTERM drains in-flight requests (10 s deadline), then deletes every remaining pooled chat session on Z.AI before exiting (a second CTRL+C force-exits)
@@ -88,11 +88,12 @@ go mod tidy
 # 3. Configure — copy the sample and fill in your values
 cp .env.example .env
 
-# 4. Install Playwright deps (only if they are not already present)
-npx playwright install-deps
+# 4. Build the collector and fetch its browser (one time, ~700 MB on disk)
+go build -trimpath -ldflags="-s -w" -o token-collector ./cmd/token-collector
+./token-collector --install-browsers
 
 # 5. Generate the token database
-go build -trimpath -ldflags="-s -w" -o token-collector ./cmd/token-collector && ./token-collector
+./token-collector
 
 # 6. Start the server
 go build -trimpath -ldflags="-s -w" -o zai-api . && ./zai-api
@@ -127,23 +128,29 @@ proxy, the token collector, and a tray supervisor. Share that one file.
 Running the setup:
 
 - Installs per-user to `%LOCALAPPDATA%\Programs\GLM-Proxy` (no administrator prompt).
-- Asks for your **Z.AI token** on a setup screen (leave blank for guest mode).
+- Requires your **Z.AI token** on a setup screen, with five steps for copying it out of your browser. Setup will not continue without one: image generation and the newer routes do not work on a guest session.
+- Downloads the Playwright browser and collects the first device tokens during setup, so the first launch has nothing left to fetch.
 - Registers autostart, so the proxy runs on every login and keeps running in the tray.
 - Starts immediately when setup finishes.
+
+Uninstalling asks whether to keep your data. Keeping it preserves `tokens.sqlite`,
+`.env` and the ~700 MB browser in `%LOCALAPPDATA%\GLM-Proxy`, so a later reinstall
+skips the download and pre-fills your token.
 
 The tray icon (right-click) has three actions:
 
 | Action           | What it does                                                              |
 | ---------------- | ------------------------------------------------------------------------- |
-| **Monitor**      | Opens a console tailing the live proxy log                                |
-| **Update token** | Prompts for a new Z.AI token, writes it to `.env`, and restarts the proxy |
-| **Exit**         | Stops this instance (autostart brings it back at next login)              |
+| **Monitor Logs** | Opens a console tailing the live proxy log                                |
+| **Change token** | Prompts for a new Z.AI token, writes it to `.env`, and restarts the proxy |
+| **Exit proxy**   | Stops this instance (autostart brings it back at next login)              |
 
 The tray supervises `zai-api.exe`: it restarts the proxy if it crashes, runs it
 windowless, and is bound to a Windows job object so the proxy can never be left
-orphaned if the tray dies. **First run** downloads a browser component and
-collects device tokens in the background, so the first minute or two of requests
-may fail until the token store fills — this is automatic and one-time.
+orphaned if the tray dies. Setup already fetched the browser and the first tokens,
+so a first run only starts serving. Should either setup step have failed, the
+proxy's monitor finishes the job on demand and the first request waits for it
+rather than failing.
 
 ### Docker (server, 24/7)
 
@@ -168,7 +175,7 @@ provider at it. For **TRAE**, add a custom model:
 | Setting  | Value                                                                 |
 | -------- | --------------------------------------------------------------------- |
 | Base URL | `http://localhost:3007/v1`                                            |
-| API key  | `Jubin` (your `AUTH_TOKEN`)                                           |
+| API key  | `Jubin` or `unlimited` (any value in `AUTH_TOKEN`)                    |
 | Model    | `glm-5.3` (set a `ZAI_TOKEN` to unlock it); `glm-4.7` works tokenless |
 
 Enable **agent mode** (the installer and Docker default already do) so tools work.
@@ -214,21 +221,21 @@ Enable **agent mode** (the installer and Docker default already do) so tools wor
 
 ### Environment Variables
 
-| Variable                  | Default   | Description                                                                                                                                                   |
-| ------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PORT`                    | `3007`    | HTTP server port                                                                                                                                              |
-| `HOST`                    | `0.0.0.0` | Bind address                                                                                                                                                  |
-| `AUTH_TOKEN`              | `Jubin`   | Bearer / `x-api-key` token for client authentication                                                                                                          |
-| `TIMEOUT`                 | `300000`  | Request timeout in milliseconds                                                                                                                               |
-| `ZAI_TOKEN`               | _(empty)_ | Hardcoded Z.AI JWT — skips guest initialization                                                                                                               |
-| `AGENT_MODE`              | `false`   | Enable agent mode (`1`/`true`/`yes`/`on`/`modern` to enable with the modern shim, `legacy` to enable with the legacy shim)                                    |
-| `AGENT_MODE_VARIANT`      | `modern`  | Agent-mode shim variant override: `modern` or `legacy` (takes precedence over the implicit variant of `AGENT_MODE`)                                           |
-| `LOG_LEVEL`               | `info`    | `debug`, `info`, `warn`, `error`, `off`. `debug` logs every Z.AI request body, response header set, and SSE line, which is expensive on the streaming path    |
-| `LOG_FORMAT`              | `text`    | Log format                                                                                                                                                    |
-| `STREAM_HOLDBACK`         | `24`      | Runes held back at the tail of a live stream so Z.AI `edit_content` tail-backtracks are absorbed before text reaches the client (`0` disables; see issue #23) |
-| `SYNC_MODE`               | `false`   | Restore the legacy synchronous session flow (one fresh chat per request, no pre-warmed pool). Used sessions are still deleted after use                       |
-| `SESSION_POOL_SIZE`       | `5`       | Standing batch of pre-made ready chat sessions kept by the async session pool                                                                                 |
-| `SESSION_ACQUIRE_TIMEOUT` | `10`      | Seconds a request waits for a pooled session before creating one directly instead of stalling (`0` = wait indefinitely)                                       |
+| Variable                  | Default           | Description                                                                                                                                                   |
+| ------------------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                    | `3007`            | HTTP server port                                                                                                                                              |
+| `HOST`                    | `127.0.0.1`       | Bind address. `127.0.0.1` accepts local clients only; set `0.0.0.0` to expose on the network                                                                  |
+| `AUTH_TOKEN`              | `Jubin,unlimited` | Accepted API keys for Bearer / `x-api-key` auth; comma-separated to allow several                                                                             |
+| `TIMEOUT`                 | `300000`          | Request timeout in milliseconds                                                                                                                               |
+| `ZAI_TOKEN`               | _(empty)_         | Hardcoded Z.AI JWT — skips guest initialization                                                                                                               |
+| `AGENT_MODE`              | `false`           | Enable agent mode (`1`/`true`/`yes`/`on`/`modern` to enable with the modern shim, `legacy` to enable with the legacy shim)                                    |
+| `AGENT_MODE_VARIANT`      | `modern`          | Agent-mode shim variant override: `modern` or `legacy` (takes precedence over the implicit variant of `AGENT_MODE`)                                           |
+| `LOG_LEVEL`               | `info`            | `debug`, `info`, `warn`, `error`, `off`. `debug` logs every Z.AI request body, response header set, and SSE line, which is expensive on the streaming path    |
+| `LOG_FORMAT`              | `text`            | Log format                                                                                                                                                    |
+| `STREAM_HOLDBACK`         | `24`              | Runes held back at the tail of a live stream so Z.AI `edit_content` tail-backtracks are absorbed before text reaches the client (`0` disables; see issue #23) |
+| `SYNC_MODE`               | `false`           | Restore the legacy synchronous session flow (one fresh chat per request, no pre-warmed pool). Used sessions are still deleted after use                       |
+| `SESSION_POOL_SIZE`       | `5`               | Standing batch of pre-made ready chat sessions kept by the async session pool                                                                                 |
+| `SESSION_ACQUIRE_TIMEOUT` | `10`              | Seconds a request waits for a pooled session before creating one directly instead of stalling (`0` = wait indefinitely)                                       |
 
 ### Logging
 
@@ -384,9 +391,8 @@ Tool-use content blocks (`tool_use` / `tool_result`) are translated to/from Open
 | `POST` | `/stop`          | ✅   | Acknowledged no-op (returns `{ success: true }`)                                                                                                           |
 | `GET`  | `/inject.js`     | ❌   | Returns `{"message":"Direct mode"}`                                                                                                                        |
 
-> `/metrics` and `/admin/*` require the auth token. They were previously
-> unauthenticated, which exposed internal state on a listener that binds
-> `0.0.0.0` by default.
+> `/metrics` and `/admin/*` require the auth token, and the listener binds
+> `127.0.0.1` by default so internal state is not exposed to the network.
 
 ---
 
@@ -710,15 +716,24 @@ CGO_ENABLED=0 GOAMD64=v3 go build -ldflags="-s -w" -trimpath -o token-collector 
 
 ### Flags
 
-| Flag               | Default | Description                                                                              |
-| ------------------ | ------- | ---------------------------------------------------------------------------------------- |
-| `--unsafe`         | `false` | Increase token limit to 1500, batch limit to 25, parallel limit to 5                     |
-| `--tokens`         | `0`     | Tokens per batch (0 = prompt; default 850, max 1500)                                     |
-| `--batch`          | `0`     | Number of batches (0 = prompt; default 5, max 9 / 25 with `--unsafe`)                    |
-| `--parallel`       | `0`     | Parallel workers (pages) on a single browser; 0 = prompt y/N (max 3 / 5 with `--unsafe`) |
-| `--headed`         | `false` | Show browser window for debugging                                                        |
-| `--block-trackers` | `false` | Enable URL allowlist filter to block tracker/analytics requests                          |
-| `--no-tui`         | `false` | Disable TUI, use plain text output                                                       |
+| Flag                 | Default         | Description                                                                              |
+| -------------------- | --------------- | ---------------------------------------------------------------------------------------- |
+| `--unsafe`           | `false`         | Increase token limit to 1500, batch limit to 25, parallel limit to 5                     |
+| `--tokens`           | `0`             | Tokens per batch (0 = prompt; default 850, max 1500)                                     |
+| `--batch`            | `0`             | Number of batches (0 = prompt; default 5, max 9 / 25 with `--unsafe`)                    |
+| `--parallel`         | `0`             | Parallel workers (pages) on a single browser; 0 = prompt y/N (max 3 / 5 with `--unsafe`) |
+| `--headed`           | `false`         | Show browser window for debugging                                                        |
+| `--block-trackers`   | `false`         | Enable URL allowlist filter to block tracker/analytics requests                          |
+| `--no-tui`           | `false`         | Disable TUI, use plain text output                                                       |
+| `--db-path`          | `tokens.sqlite` | Path to the SQLite token database                                                        |
+| `--fresh`            | `false`         | Delete the existing database first instead of appending                                  |
+| `--install-browsers` | `false`         | Download the Playwright driver and Chromium, then exit (the installer's setup step)      |
+| `--skip-if-stocked`  | `0`             | Exit without collecting if the database already holds at least this many tokens          |
+| `--deadline`         | `0`             | Give up after this many seconds (0 = no limit); used by setup to bound an unattended run |
+
+Playwright's driver and browsers are kept in `%LOCALAPPDATA%\GLM-Proxy` on Windows,
+or the equivalent user cache directory elsewhere, so an uninstall can preserve them.
+Set `PLAYWRIGHT_BROWSERS_PATH` or `PLAYWRIGHT_DRIVER_PATH` to override.
 
 ### Usage Examples
 
@@ -794,7 +809,7 @@ glm-proxy/
 │   └── *_test.go                  # Whitebox tests (agent/TRAE, SSE parser)
 ├── cmd/
 │   ├── token-collector/           # Harvests device tokens into tokens.sqlite (TUI)
-│   └── glm-tray/                  # Windows tray supervisor (Monitor/Update token/Exit)
+│   └── glm-tray/                  # Windows tray supervisor (Monitor Logs/Change token/Exit proxy)
 ├── installer/
 │   ├── installer.nsi              # NSIS installer (token page, autostart, Jubin)
 │   └── logo.svg                   # Official Z.AI logo, source for the icon
@@ -819,7 +834,7 @@ go test ./...
 
 - **There is no public hosted instance.** Run it yourself — see [Deployment](#deployment).
 - Device tokens are **consumed** after use, but the background monitor replenishes them automatically once the store drops below `TOKEN_MIN`. Each captcha computation makes up to **5 attempts**, and a token is only spent by the call that actually consumes it.
-- The default auth token (`Jubin`) is a placeholder — set `AUTH_TOKEN` in production.
+- The default auth keys (`Jubin`, `unlimited`) are placeholders — set your own `AUTH_TOKEN` (comma-separated for several) before exposing the proxy beyond `127.0.0.1`.
 - `ZAI_TOKEN` bypasses guest initialization entirely. Without it, Z.AI's guest session typically only permits `glm-4.7`.
 - `LOG_LEVEL=debug` dumps every Z.AI request body, response status/headers, and SSE lines — useful for troubleshooting.
 - `image_generation` is **always `false`** and cannot be enabled via `/features` or per-request overrides.

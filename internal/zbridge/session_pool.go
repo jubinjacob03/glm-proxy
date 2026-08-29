@@ -1,28 +1,21 @@
-// session_pool.go
 // Throwaway chat sessions and the async session pool.
 //
-// OpenAI-compatible clients are stateless: they re-send the entire
-// conversation on every request. The bridge forwards that history to Z.AI
-// inside a chat identified by chat_id, and every chat a completion references
-// materialises server-side under the bridge account along with its history.
-// Two problems follow if those chats are left behind:
+// OpenAI-compatible clients are stateless and re-send the whole conversation
+// every time. Z.AI materialises a server-side chat with its own history for each
+// chat_id a completion references, so leaving them behind causes two problems:
 //
 //  1. Accumulation: one dead session per proxied request, forever.
-//  2. Context rot: a chat that outlives its request means Z.AI's stored
-//     history stacks on top of the history the client already re-sent, so the
-//     model sees duplicated and stale context.
+//  2. Context rot: Z.AI's stored history stacks on top of the history the client
+//     already re-sent, so the model sees duplicated, stale context.
 //
-// So every request runs on a throwaway session that is deleted upstream as
-// soon as its response is written or has definitively failed. Async mode (the
-// default) keeps a standing batch of SESSION_POOL_SIZE ready sessions and
-// refills it as each is consumed; --sync-mode mints one per request instead.
-// Graceful shutdown drains in-flight requests, then deletes every session
-// still sitting in the pool.
+// So every request runs on a session deleted upstream as soon as its response is
+// written or has definitively failed. Async mode (default) keeps a standing batch
+// of SESSION_POOL_SIZE ready and refills as they are consumed; --sync-mode mints
+// one per request. Shutdown drains in-flight requests, then deletes the rest.
 //
-// Z.AI chat IDs are client-generated UUIDs, so minting is local and instant
-// and an unconsumed session never touches the account. Deletion is one
-// DELETE /api/v1/chats/{id} per chat, and the "could not find" reply counts as
-// success, which keeps the collector idempotent.
+// Chat IDs are client-generated UUIDs, so minting is local and instant and an
+// unconsumed session never touches the account. Deleting is one DELETE per chat,
+// and a "could not find" reply counts as success so the operation is idempotent.
 
 package zbridge
 
@@ -39,45 +32,42 @@ import (
 )
 
 var (
-	// ErrPoolClosing is returned by Acquire once Shutdown has begun.
+	// ErrPoolClosing comes back from Acquire once Shutdown has begun.
 	ErrPoolClosing = errors.New("session pool is shutting down")
-	// ErrPoolTimeout is returned by Acquire when no pooled session became
-	// available within the configured wait window.
+	// ErrPoolTimeout means no session freed up inside the wait window.
 	ErrPoolTimeout = errors.New("timed out waiting for a pooled session")
 )
 
 const (
-	// defaultPoolSize is the standing batch of pre-made ready sessions.
+	// The standing batch of pre-made ready sessions.
 	defaultPoolSize = 5
-	// defaultPoolWait bounds how long a completion request waits for a
-	// pooled session before creating one directly (SESSION_ACQUIRE_TIMEOUT).
+	// How long a request waits before minting its own (SESSION_ACQUIRE_TIMEOUT).
 	defaultPoolWait = 10 * time.Second
-	// poolOpTimeout bounds one upstream delete call.
+	// Bounds one upstream delete call.
 	poolOpTimeout = 30 * time.Second
-	// Retry delay when session creation fails. On Z.AI creation is local and
-	// cannot fail, but a backend that calls upstream would need this.
+	// Creation cannot fail on Z.AI (it is local), but a backend that called
+	// upstream would need this retry delay.
 	poolCreateBackoffStart = 1 * time.Second
 	poolCreateBackoffMax   = 15 * time.Second
-	// poolDrainWait bounds how long Shutdown waits for in-flight
-	// retire/refill operations before reporting leftovers.
+	// How long Shutdown waits for in-flight work before reporting leftovers.
 	poolDrainWait = 20 * time.Second
 )
 
-// SessionBackend is the slice of the Z.AI bridge the pool needs. Tests
-// substitute a stub; the production backend is zaiSessionBackend.
+// SessionBackend is the slice of the bridge the pool needs; tests substitute a
+// stub for zaiSessionBackend.
 type SessionBackend interface {
 	CreateChatSession(ctx context.Context) (string, error)
 	DeleteChatSession(ctx context.Context, sessionIDs ...string) error
 }
 
-// zaiSessionBackend implements SessionBackend against chat.z.ai.
+// zaiSessionBackend is SessionBackend against chat.z.ai.
 type zaiSessionBackend struct{}
 
-// NewZAIChatBackend returns the production SessionBackend.
+// NewZAIChatBackend returns the production backend.
 func NewZAIChatBackend() SessionBackend { return zaiSessionBackend{} }
 
-// CreateChatSession mints one fresh chat ID. Nothing happens upstream: a Z.AI
-// chat only materialises when a completion first references it.
+// CreateChatSession mints a chat ID locally; the chat only materialises upstream
+// when a completion first references it.
 func (zaiSessionBackend) CreateChatSession(ctx context.Context) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -85,9 +75,8 @@ func (zaiSessionBackend) CreateChatSession(ctx context.Context) (string, error) 
 	return randomUUID(), nil
 }
 
-// DeleteChatSession deletes chats one by one (Z.AI has no bulk endpoint).
-// Best-effort: every ID is attempted; the first error is returned after the
-// rest have been tried.
+// DeleteChatSession deletes one at a time, since Z.AI has no bulk endpoint. Every
+// ID is attempted; the first error is returned once the rest have been tried.
 func (zaiSessionBackend) DeleteChatSession(ctx context.Context, sessionIDs ...string) error {
 	var firstErr error
 	for _, id := range sessionIDs {
@@ -101,9 +90,9 @@ func (zaiSessionBackend) DeleteChatSession(ctx context.Context, sessionIDs ...st
 	return firstErr
 }
 
-// DeleteZAIChat removes one chat from the Z.AI account. It is idempotent: an
-// "already gone" reply counts as success, so the collector never gets stuck on
-// a chat that was retired twice. A 401 forces a session re-init and one retry.
+// DeleteZAIChat removes one chat, idempotently: an "already gone" reply counts as
+// success so a double retire cannot wedge the collector. A 401 forces one re-init
+// and retry.
 func DeleteZAIChat(ctx context.Context, chatID string) error {
 	if chatID == "" {
 		return nil
@@ -147,7 +136,7 @@ func DeleteZAIChat(ctx context.Context, chatID string) error {
 
 		switch {
 		case resp.StatusCode == 401:
-			// Token expired mid-flight: force re-init and retry once.
+			// Token expired mid-flight: re-init and retry once.
 			session.mu.Lock()
 			session.Initialized = false
 			session.mu.Unlock()
@@ -163,9 +152,9 @@ func DeleteZAIChat(ctx context.Context, chatID string) error {
 	return errors.New("chat delete: max retries exceeded")
 }
 
-// SessionPool holds the standing batch of ready chat sessions. Completions draw
-// a pre-made session instead of minting one, and each consumed session is
-// deleted upstream and replaced as soon as its response is processed.
+// SessionPool holds the standing batch. Completions draw a pre-made session
+// rather than minting one, and each consumed session is deleted upstream and
+// replaced once its response is processed.
 type SessionPool struct {
 	backend SessionBackend
 	size    int
@@ -179,8 +168,8 @@ type SessionPool struct {
 	wg sync.WaitGroup // outstanding create/delete operations
 }
 
-// NewSessionPool builds a pool that keeps size sessions ready, clamping size
-// below 1 to the default. Call Start to begin warmup.
+// NewSessionPool keeps size sessions ready, clamping below 1 to the default.
+// Call Start to warm up.
 func NewSessionPool(backend SessionBackend, size int) *SessionPool {
 	if size < 1 {
 		size = defaultPoolSize
@@ -195,10 +184,10 @@ func NewSessionPool(backend SessionBackend, size int) *SessionPool {
 
 func (p *SessionPool) Size() int { return p.size }
 
-// Ready reports how many sessions are currently stocked.
+// Ready reports how many sessions are stocked right now.
 func (p *SessionPool) Ready() int { return len(p.ready) }
 
-// Start pre-makes the initial batch.
+// Start warms the initial batch in the background.
 func (p *SessionPool) Start() {
 	logInfof("[Pool] warming up %d stateless session(s)...", p.size)
 	for i := 0; i < p.size; i++ {
@@ -210,10 +199,9 @@ func (p *SessionPool) Start() {
 	}
 }
 
-// Acquire hands out one ready session, blocking until one is available, ctx is
-// done, or wait elapses (wait <= 0 waits indefinitely). The caller must always
-// call Release with the returned ID, including on error paths, or the session
-// is never retired and the batch never refilled.
+// Acquire hands out one ready session, blocking until one frees up, ctx is done,
+// or wait elapses (wait <= 0 waits forever). The caller must always Release the
+// returned ID, error paths included, or the batch is never refilled.
 func (p *SessionPool) Acquire(ctx context.Context, wait time.Duration) (string, error) {
 	var timeout <-chan time.Time
 	if wait > 0 {
@@ -236,8 +224,7 @@ func (p *SessionPool) Acquire(ctx context.Context, wait time.Duration) (string, 
 	}
 }
 
-// Release retires a consumed session: it is deleted upstream, then a
-// replacement fills the gap in the batch. Both steps run in the background.
+// Release deletes the session upstream, then refills the gap. Both in background.
 func (p *SessionPool) Release(sessionID string) {
 	if sessionID == "" {
 		return
@@ -253,9 +240,9 @@ func (p *SessionPool) Release(sessionID string) {
 	}()
 }
 
-// Shutdown stops refills, deletes every still-pooled session upstream, and
-// waits (bounded) for in-flight retire/refill work. Sessions already checked
-// out are deleted by their own request's Release.
+// Shutdown stops refills, deletes every still-pooled session and waits, bounded,
+// for in-flight retire and refill work. Checked-out sessions are handled by their
+// own request's Release.
 func (p *SessionPool) Shutdown() {
 	first := false
 	p.stopOnce.Do(func() {
@@ -304,8 +291,8 @@ func (p *SessionPool) Shutdown() {
 	}
 }
 
-// fillSlot creates one session, retrying through transient failures, and stocks
-// it unless shutdown won the race. Synchronous; callers add the goroutine.
+// fillSlot creates one session, retrying transient failures, and stocks it unless
+// shutdown won the race. Synchronous; the caller supplies the goroutine.
 func (p *SessionPool) fillSlot(reason string) {
 	backoff := poolCreateBackoffStart
 	loggedOnce := false
@@ -320,8 +307,7 @@ func (p *SessionPool) fillSlot(reason string) {
 			if p.stopped.Load() {
 				return
 			}
-			// First failure is loud, repeats stay quiet so a misconfigured
-			// backend cannot spam the log.
+			// Loud once, then quiet: a misconfigured backend must not spam.
 			if !loggedOnce {
 				logErrorf("[Pool:%s] session creation failed (%v); retrying...", reason, err)
 				loggedOnce = true
@@ -344,8 +330,8 @@ func (p *SessionPool) fillSlot(reason string) {
 	}
 }
 
-// stock adds a fresh session to the batch, or deletes it if shutdown raced in
-// first, so the account never keeps sessions nobody will consume.
+// stock adds a session to the batch, or deletes it if shutdown raced in, so the
+// account never holds sessions nobody will consume.
 func (p *SessionPool) stock(id, reason string) {
 	select {
 	case p.ready <- id:
@@ -355,7 +341,7 @@ func (p *SessionPool) stock(id, reason string) {
 	}
 }
 
-// deleteOne deletes a single session upstream, best-effort.
+// deleteOne retires one session upstream, best-effort.
 func (p *SessionPool) deleteOne(id, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), poolOpTimeout)
 	defer cancel()
@@ -366,21 +352,18 @@ func (p *SessionPool) deleteOne(id, reason string) {
 	logDebugf("[Pool:%s] deleted chat session: %s", reason, id)
 }
 
-// ============================================================================
-// BRIDGE GLUE
-// ============================================================================
+// Glue between the pool and the request path: the handlers acquire and release
+// through these rather than touching the pool directly.
 
 var (
-	// nil in sync mode, where the per-request flow still collects used
-	// sessions.
+	// nil in sync mode, where the per-request flow still collects used sessions.
 	sessionPool *SessionPool
-	// How long a request waits for a pooled session before creating one
-	// directly. 0 waits forever. See SESSION_ACQUIRE_TIMEOUT.
+	// 0 waits forever. See SESSION_ACQUIRE_TIMEOUT.
 	poolWait = defaultPoolWait
 )
 
-// AttachSessionPool swaps the pool and its acquire window, returning a function
-// that restores the previous attachment. Passing nil switches to sync mode.
+// AttachSessionPool swaps the pool and its wait window, returning a restore func.
+// nil switches to sync mode.
 func AttachSessionPool(p *SessionPool, wait time.Duration) func() {
 	oldPool, oldWait := sessionPool, poolWait
 	sessionPool, poolWait = p, wait
@@ -389,12 +372,9 @@ func AttachSessionPool(p *SessionPool, wait time.Duration) func() {
 	}
 }
 
-// AcquireStatelessSession returns a throwaway chat ID for one request. If a
-// burst exhausts the batch the request waits up to poolWait, then creates a
-// session directly rather than stalling indefinitely.
-//
-// The second return value reports whether the session is pool-owned (retired
-// through pool.Release) or on-demand (retired through gcSessions).
+// AcquireStatelessSession returns a throwaway chat ID. A burst that exhausts the
+// batch waits up to poolWait, then mints one directly rather than stalling. The
+// bool reports pool-owned (retired via pool.Release) versus on-demand (gcSessions).
 func AcquireStatelessSession(ctx context.Context) (chatID string, pooled bool, err error) {
 	if sessionPool == nil {
 		return randomUUID(), false, nil
@@ -416,9 +396,9 @@ func AcquireStatelessSession(ctx context.Context) (chatID string, pooled bool, e
 	}
 }
 
-// ReleaseStatelessSession retires a used chat session. Call it only once the
-// response is fully written or has definitively failed: the chat is deleted on
-// Z.AI, and in async mode the pool immediately stocks a replacement.
+// ReleaseStatelessSession retires a used session. Call it only once the response
+// is fully written or has definitively failed: the chat is deleted upstream and,
+// in async mode, immediately replaced.
 func ReleaseStatelessSession(chatID string, pooled bool) {
 	if chatID == "" {
 		return
@@ -430,8 +410,28 @@ func ReleaseStatelessSession(chatID string, pooled bool) {
 	gcSessions("stateless", chatID)
 }
 
-// gcSessions deletes used-up chat sessions in the background, so response
-// latency is unaffected. Best-effort: failures are logged and ignored.
+// sessionGCWait tracks background deletes so shutdown can wait for them.
+var sessionGCWait sync.WaitGroup
+
+const sessionGCDrain = 8 * time.Second
+
+// waitForSessionGC waits for in-flight deletes, bounded so a hung upstream cannot
+// block exit.
+func waitForSessionGC(limit time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		sessionGCWait.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(limit):
+		logWarnf("[Shutdown] gave up waiting for session cleanup after %s", limit)
+	}
+}
+
+// gcSessions deletes spent sessions in the background so response latency is
+// unaffected. Failures are logged and ignored.
 func gcSessions(reason string, sessionIDs ...string) {
 	ids := make([]string, 0, len(sessionIDs))
 	for _, id := range sessionIDs {
@@ -442,8 +442,10 @@ func gcSessions(reason string, sessionIDs ...string) {
 	if len(ids) == 0 {
 		return
 	}
+	sessionGCWait.Add(1)
 	go func() {
-		// Its own context: the triggering request may already be gone.
+		defer sessionGCWait.Done()
+		// Its own context, because the triggering request may already be gone.
 		ctx, cancel := context.WithTimeout(context.Background(), poolOpTimeout)
 		defer cancel()
 		backend := zaiSessionBackend{}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -11,21 +12,38 @@ import (
 	"time"
 )
 
-// decodeRequestBody parses an inbound JSON body into dst under the configured
-// size cap.
+// errBodyTooLarge lets callers answer 413 instead of blaming the client's JSON.
+var errBodyTooLarge = errors.New("request body too large")
+
+// decodeRequestBody parses a JSON body into dst under the configured size cap.
 func decodeRequestBody(r *http.Request, dst interface{}) error {
 	limit := config.MaxRequestBytes
 	if limit <= 0 {
 		limit = 32 << 20
 	}
-	dec := json.NewDecoder(io.LimitReader(r.Body, limit+1))
-	if err := dec.Decode(dst); err != nil {
+	if r.ContentLength > limit {
+		return errBodyTooLarge
+	}
+	// One byte past the limit: an exhausted reader proves oversize, not truncation.
+	lr := &io.LimitedReader{R: r.Body, N: limit + 1}
+	if err := json.NewDecoder(lr).Decode(dst); err != nil {
+		if lr.N <= 0 {
+			return errBodyTooLarge
+		}
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return errors.New("request body is empty or truncated")
 		}
-		return errors.New("Invalid JSON")
+		return errors.New("invalid JSON")
 	}
 	return nil
+}
+
+// statusForDecodeError maps a decode failure to its HTTP status.
+func statusForDecodeError(err error) int {
+	if errors.Is(err, errBodyTooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
 }
 
 func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
@@ -50,9 +68,10 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		ReasoningEffort string          `json:"reasoning_effort"`
 	}
 	if err := decodeRequestBody(r, &body); err != nil {
+		status := statusForDecodeError(err)
 		metrics.requestsRejected.Add(1)
-		access.fail(400, err.Error())
-		writeJSON(w, 400, formatOpenAIError(err.Error(), "invalid_request_error", nil))
+		access.fail(status, err.Error())
+		writeJSON(w, status, formatOpenAIError(err.Error(), "invalid_request_error", nil))
 		return
 	}
 
@@ -77,46 +96,16 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	access.stream = stream
 
-	if isConnectivityTest(messages) && len(body.Tools) == 0 {
-		access.status = 200
-		id := "chatcmpl-" + generateID()
-		if stream {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-			w.WriteHeader(200)
-			flusher, _ := w.(http.Flusher)
-			role := "assistant"
-			roleChunk := oaChunk{ID: id, Object: "chat.completion.chunk", Created: nowUnix(), Model: model, Choices: []oaChoice{{Index: 0, Delta: &oaDelta{Role: role}}}}
-			w.Write([]byte("data: " + mustJSON(roleChunk) + "\n\n"))
-			if flusher != nil {
-				flusher.Flush()
-			}
-			content := "Hello! GLM proxy is ready."
-			stop := "stop"
-			contentChunk := oaChunk{ID: id, Object: "chat.completion.chunk", Created: nowUnix(), Model: model, Choices: []oaChoice{{Index: 0, Delta: &oaDelta{Content: &content}, FinishReason: &stop}}}
-			w.Write([]byte("data: " + mustJSON(contentChunk) + "\n\n"))
-			if flusher != nil {
-				flusher.Flush()
-			}
-			w.Write([]byte("data: [DONE]\n\n"))
-			if flusher != nil {
-				flusher.Flush()
-			}
-		} else {
-			stop := "stop"
-			resp := oaChunk{
-				ID: id, Object: "chat.completion", Created: nowUnix(), Model: model,
-				Choices: []oaChoice{{Index: 0, Message: &oaMessage{Role: "assistant", Content: "Hello! GLM proxy is ready."}, FinishReason: &stop}},
-				Usage:   &oaUsage{PromptTokens: 5, CompletionTokens: 6, TotalTokens: 11},
-			}
-			writeJSON(w, 200, resp)
-		}
+	imageParts := extractImageParts(body.Messages)
+	if len(imageParts) > maxImagesPerRequest {
+		msg := fmt.Sprintf("too many images: %d provided, limit is %d per request",
+			len(imageParts), maxImagesPerRequest)
+		access.fail(400, msg)
+		writeJSON(w, 400, formatOpenAIError(msg, "invalid_request_error", nil))
 		return
 	}
 
-	// Every request runs on a throwaway chat that is deleted on Z.AI once the
-	// response is processed, so no server-side history outlives it.
+	// Throwaway chat, deleted upstream once the response is processed.
 	chatID, pooled, err := AcquireStatelessSession(r.Context())
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -130,7 +119,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	defer ReleaseStatelessSession(chatID, pooled)
 	requestId := generateID()
 
-	// Agent mode rewrites tools and non-user roles into a form Z.AI accepts.
+	// Rewrites tools and non-user roles into a form Z.AI accepts.
 	var transformedMessages json.RawMessage = body.Messages
 	if config.AgentMode {
 		if tm, err := agentTransformMessages(body.Messages, body.Tools); err == nil {
@@ -146,17 +135,26 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	prompt := messagesToPrompt(messages)
 
+	upstreamModel := model
+	if len(imageParts) > 0 && !modelSupportsVision(model) {
+		if vm := resolveVisionModel(model); vm != "" {
+			logConsolef("[Vision] %s cannot accept images; routing this request to %s", printableASCII(model), vm)
+			upstreamModel = vm
+		} else {
+			logErrorf("[Vision] %s cannot accept images and no vision model is available", printableASCII(model))
+		}
+	}
+
 	// Features resolve per-model inside sendToZAI; only explicit body fields
-	// become per-request overrides.
+	// override per request.
 	opts := SendOptions{
-		Model:             model,
+		Model:             upstreamModel,
 		ChatID:            chatID,
 		ClientMessagesRaw: transformedMessages,
 		ReasoningEffort:   body.ReasoningEffort,
 	}
 
-	// Both `reasoning: bool` and `thinking: {type: enabled|disabled}` map onto
-	// the upstream enable_thinking feature.
+	// Both `reasoning: bool` and `thinking: {type: ...}` map onto enable_thinking.
 	if body.Reasoning != nil {
 		opts.Thinking = body.Reasoning
 	} else if len(body.Thinking) > 0 {
@@ -175,8 +173,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		opts.WebSearch = body.Search
 	}
 
-	// Cancelling this tears down the upstream request and releases the
-	// producer goroutine, so no exit path leaves either running.
+	// Cancelling tears down the upstream request and its producer goroutine, so
+	// no exit path leaves either running.
 	upstreamCtx, cancelUpstream := context.WithCancel(r.Context())
 	defer cancelUpstream()
 
@@ -208,9 +206,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		toolCallEmitted := false
 		toolCallSeq := 0
 
-		// Normalise every streamed tool_call so assembling clients never choke:
-		// a delta must carry index (the position OpenAI clients accumulate by),
-		// an id, and type "function". The interceptors already set these; the
+		// Every streamed tool_call needs index, id and type "function" or
+		// assembling clients choke. The interceptors set these; the
 		// end-of-stream fallback extractor does not.
 		emitToolCallDelta := func(tc map[string]interface{}) {
 			if tc == nil {
@@ -249,7 +246,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		errored := false
 		ch, err := sendToZAI(upstreamCtx, prompt, opts)
 		if err != nil {
-			logErrorf("[Stream] %s", err.Error())
+			logErrorf("[Stream] %s", printableASCII(err.Error()))
 			metrics.requestsFailed.Add(1)
 			access.fail(statusFromError(err.Error()), err.Error())
 			sse.data(formatOpenAIError(err.Error(), "api_error", statusFromError(err.Error())))
@@ -266,7 +263,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				if result.Err != nil {
-					logErrorf("[Stream] %s", result.Err.Error())
+					logErrorf("[Stream] %s", printableASCII(result.Err.Error()))
 					metrics.requestsFailed.Add(1)
 					access.fail(statusFromError(result.Err.Error()), result.Err.Error())
 					sse.data(formatOpenAIError(result.Err.Error(), "api_error", statusFromError(result.Err.Error())))
@@ -281,9 +278,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				if result.FullText != "" && !strings.HasPrefix(result.FullText, fullContent) {
-					// A deep edit_content rewrite rewound text that was
-					// already forwarded: the agent interceptor's view of
-					// the stream is stale, reset it (issue #23).
+					// A deep edit_content rewrite rewound already-forwarded text,
+					// so the interceptor's view is stale; reset it (issue #23).
 					if interceptor != nil {
 						interceptor = newAgentInterceptor()
 					}
@@ -301,7 +297,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					fullContent = contentBuf.String()
 				}
 
-				// The parser emits the exact rune-safe delta to forward.
+				// The parser already emitted a rune-safe delta.
 				delta := result.Chunk
 				if delta == "" {
 					continue
@@ -324,9 +320,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 		if !errored {
 			if interceptor != nil {
-				// Drain the interceptor tail: trailing text plus any
-				// tool call whose block only completed at end of stream
-				// (the modern shim holds back a window while streaming).
+				// Drain the tail: trailing text plus any call whose block only
+				// completed at end of stream (the shim's hold-back window).
 				rem, tailCalls := interceptor.finish()
 				if rem != "" && !toolCallEmitted {
 					sse.data(oaContentDelta(model, requestId, rem))
@@ -336,7 +331,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					toolCallEmitted = true
 				}
 
-				// Safety net: fallback tool call extraction at stream end
+				// Safety net: re-scan the whole text at stream end.
 				if !toolCallEmitted {
 					fallbackCalls := agentExtractToolCalls(fullContent)
 					if len(fallbackCalls) > 0 {
@@ -399,7 +394,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		fullReasoning := reasoningBuf.String()
 
-		// Agent-mode: parse out tool-call blocks for non-stream response
+		// Agent mode: lift tool-call blocks out of the finished text.
 		if config.AgentMode {
 			if toolCalls := agentExtractToolCalls(fullContent); len(toolCalls) > 0 {
 				writeJSON(w, 200, formatOpenAIToolCallResponse(
@@ -415,12 +410,12 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func featuresHandler(w http.ResponseWriter, r *http.Request) {
-	// ── GET: return resolved features for a model ──
+	// GET: resolved features for one model.
 	if r.Method == "GET" {
 		model := r.URL.Query().Get("model")
 		if model != "" {
 			resolved := resolveFeaturesForModel(model)
-			state := getModelFeatureState(model)
+			state := snapshotModelFeatureState(model)
 			caps := getModelCapabilities(model)
 			writeJSON(w, 200, map[string]interface{}{
 				"model":        model,
@@ -431,13 +426,15 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		// No model specified — return all per-model states
+		// No model given: return every per-model state.
+		// Copied, not aliased: these maps are encoded after the unlock below.
 		modelFeatureStatesMu.Lock()
-		states := make(map[string]interface{})
+		states := make(map[string]interface{}, len(modelFeatureStates))
 		for k, v := range modelFeatureStates {
+			snap := copyFeatureStateLocked(v)
 			states[k] = map[string]interface{}{
-				"includeAll": v.IncludeAll,
-				"overrides":  v.Overrides,
+				"includeAll": snap.IncludeAll,
+				"overrides":  snap.Overrides,
 			}
 		}
 		modelFeatureStatesMu.Unlock()
@@ -452,18 +449,15 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── POST: update per-model feature state ──
+	// POST: update per-model feature state.
 
-	bodyBytes, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeJSON(w, 400, map[string]interface{}{"error": "Failed to read body"})
-		return
-	}
-
-	// Parse as raw map to capture arbitrary capability keys
+	// A raw map, to capture arbitrary capability keys. The shared decoder applies
+	// MAX_REQUEST_BYTES; a bare io.ReadAll here was an OOM per request.
 	var body map[string]interface{}
-	if err := json.Unmarshal(bodyBytes, &body); err != nil {
-		writeJSON(w, 400, map[string]interface{}{"error": "Invalid JSON"})
+	if err := decodeRequestBody(r, &body); err != nil {
+		status := statusForDecodeError(err)
+		metrics.requestsRejected.Add(1)
+		writeJSON(w, status, map[string]interface{}{"error": err.Error()})
 		return
 	}
 
@@ -473,7 +467,7 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check Include-All-Features header
+	// Include-All-Features opts into forwarding every server capability.
 	includeAllHeader := strings.EqualFold(r.Header.Get("Include-All-Features"), "true")
 
 	modelFeatureStatesMu.Lock()
@@ -486,19 +480,19 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 		modelFeatureStates[model] = state
 	}
 
-	// Set IncludeAll flag if header is present
+	// Sticky: once set it stays until overwritten.
 	if includeAllHeader {
 		state.IncludeAll = true
 	}
 
-	// Process user overrides — any key except "model" is treated as a feature override.
-	// Special handling: reasoning/thinking -> enable_thinking
+	// Every key but "model" is a feature override; reasoning and thinking are
+	// aliased onto enable_thinking.
 	for k, v := range body {
 		if k == "model" {
 			continue
 		}
 
-		// reasoning: true/false -> enable_thinking
+		// reasoning: bool maps to enable_thinking.
 		if k == "reasoning" {
 			if b, ok := v.(bool); ok {
 				state.Overrides["enable_thinking"] = b
@@ -506,7 +500,7 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// "thinking": {"type":"enabled"|"disabled"} or thinking: true/false -> enable_thinking
+		// thinking: bool, or {"type":"enabled"|"disabled"}, same target.
 		if k == "thinking" {
 			if b, ok := v.(bool); ok {
 				state.Overrides["enable_thinking"] = b
@@ -521,25 +515,25 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// All other keys: convert camelCase to snake_case (no alias mapping)
+		// Everything else: camelCase to snake_case, no alias mapping.
 		snakeKey := normalizeFeatureKey(k)
-		// image_generation overrides are ignored — always forced false
+		// Always forced false on this endpoint.
 		if snakeKey == "image_generation" {
 			continue
 		}
-		// 'think' is not accepted — use enable_thinking, reasoning, or thinking
+		// Not accepted; use enable_thinking, reasoning or thinking.
 		if snakeKey == "think" {
 			continue
 		}
-		// reasoning_effort is a per-request parameter validated against model
-		// capabilities; it is NOT stored as a persistent override.
+		// Per-request only, validated against model capabilities, so it is never
+		// stored as a persistent override.
 		if snakeKey == "reasoning_effort" {
 			continue
 		}
 		state.Overrides[snakeKey] = v
 	}
 
-	// Resolve final features for response
+	// Resolve what the response will report.
 	caps := getModelCapabilities(model)
 	resolved := resolveFeaturesWithState(caps, state)
 	includeAll := state.IncludeAll
@@ -549,7 +543,7 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	modelFeatureStatesMu.Unlock()
 
-	// Update session.Features for backward compat (dashboard display)
+	// Kept in sync for the dashboard's benefit.
 	session.mu.Lock()
 	if v, ok := resolved["auto_web_search"].(bool); ok {
 		session.Features.WebSearch = v
@@ -598,8 +592,8 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	sessionReady := session.Initialized
 	session.mu.Unlock()
 
-	// Device tokens are the real consumable: with none left, no captcha
-	// parameter can be produced and every completion fails.
+	// Device tokens are the real consumable: with none left no captcha parameter
+	// can be produced and every completion fails.
 	tokens := getTokenCount()
 	tokensLow := tokens < config.TokenMonitor.MinTokens
 	healthy := sessionReady && tokens > 0

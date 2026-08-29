@@ -1,12 +1,11 @@
 // Agent mode (legacy): the original [ROLE: ...] rewrite shim, kept for
-// backward compatibility and selected with AGENT_MODE_VARIANT=legacy. The
-// default modern shim lives in agent.go.
+// compatibility and selected with AGENT_MODE_VARIANT=legacy. The default modern
+// shim lives in agent.go.
 //
 // It flattens the conversation into user messages tagged with their original
-// role, and renders the OpenAI tools array as a contract requiring the model to
-// emit calls as <<<TOOL_CALL>>>{...}<<<END_TOOL_CALL>>> blocks. The SSE streamer
-// intercepts those blocks and rewrites them into OpenAI tool_calls deltas with
-// finish_reason="tool_calls".
+// role, and renders the tools array as a contract demanding
+// <<<TOOL_CALL>>>{...}<<<END_TOOL_CALL>>> blocks, which the SSE streamer rewrites
+// into OpenAI tool_calls deltas with finish_reason="tool_calls".
 
 package zbridge
 
@@ -52,7 +51,7 @@ End of tool contract.`
 const agentToolCallStart = "<<<TOOL_CALL>>>"
 const agentToolCallEnd = "<<<END_TOOL_CALL>>>"
 
-// renderToolsContract formats an OpenAI tools array as the contract body.
+// renderToolsContract formats the tools array as the contract body.
 func renderToolsContract(tools []interface{}) string {
 	var sb strings.Builder
 	for i, t := range tools {
@@ -85,8 +84,7 @@ func renderToolsContract(tools []interface{}) string {
 	return sb.String()
 }
 
-// extractContentString coerces an OpenAI content field, string or array of
-// parts, into a single string.
+// extractContentString coerces a content field (string or parts) to one string.
 func extractContentString(c interface{}) string {
 	if c == nil {
 		return ""
@@ -114,10 +112,9 @@ func extractContentString(c interface{}) string {
 	return string(b)
 }
 
-// transformMessagesForAgent rewrites an OpenAI messages array for Z.AI: the
-// system prefix is prepended as a user message, every non-user role becomes a
-// user message tagged [ROLE: x], and a tool contract message is appended when
-// tools are present.
+// transformMessagesForAgent rewrites messages for Z.AI: the system prefix becomes
+// a leading user message, every non-user role becomes a user message tagged
+// [ROLE: x], and a tool contract is appended when tools are present.
 func transformMessagesForAgent(rawMessages json.RawMessage, tools []interface{}) ([]byte, error) {
 	var msgs []map[string]interface{}
 	if err := json.Unmarshal(rawMessages, &msgs); err != nil {
@@ -160,9 +157,8 @@ func transformMessagesForAgent(rawMessages json.RawMessage, tools []interface{})
 		})
 	}
 
-	// Re-attach any image parts the string flattening dropped. They ride on the
-	// last user message as an OpenAI content array so a vision model can see
-	// them; text-only conversations are unaffected.
+	// Re-attach image parts the flattening above dropped, on the last user
+	// message as a content array. Text-only conversations are unaffected.
 	if imgs := extractImageParts(rawMessages); len(imgs) > 0 && len(out) > 0 {
 		last := out[len(out)-1]
 		text, _ := last["content"].(string)
@@ -177,15 +173,15 @@ func transformMessagesForAgent(rawMessages json.RawMessage, tools []interface{})
 	return json.Marshal(out)
 }
 
-// agentStreamInterceptor rewrites tool-call blocks in assistant output into
-// OpenAI tool_calls deltas. Everything else passes through verbatim.
+// agentStreamInterceptor turns tool-call blocks into tool_calls deltas; anything
+// else passes through verbatim.
 type agentStreamInterceptor struct {
 	buf       strings.Builder
 	flushed   int  // offset into buf that has been processed
 	emitting  bool // currently inside a tool-call block
 	callIndex int
 
-	// Incremental argument-streaming state.
+	// State for streaming arguments incrementally.
 	tcNameFound    bool
 	tcName         string
 	tcId           string
@@ -217,9 +213,9 @@ func (a *agentStreamInterceptor) resetToolCallState() {
 	a.tcFallback = false
 }
 
-// tryExtractName pulls the "name" value out of partial JSON, returning it with
-// the offset after its closing quote, or "" and -1. The search stops before the
-// "arguments" key so nested keys cannot match.
+// tryExtractName pulls "name" out of partial JSON with the offset after its
+// closing quote, or "" and -1. It stops before "arguments" so nested keys cannot
+// match.
 func tryExtractName(text string) (string, int) {
 	searchEnd := len(text)
 	if argsIdx := strings.Index(text, `"arguments"`); argsIdx >= 0 {
@@ -254,8 +250,8 @@ func tryExtractName(text string) (string, int) {
 	return "", -1
 }
 
-// findArgsStart locates the "arguments" value in partial JSON, but only when it
-// opens with '{'. Returns -1 if absent, non-object, or not yet complete enough.
+// findArgsStart locates the "arguments" value, but only when it opens with '{'.
+// Returns -1 if absent, not an object, or still too short to tell.
 func findArgsStart(text string) int {
 	keyIdx := strings.Index(text, `"arguments"`)
 	if keyIdx < 0 {
@@ -281,9 +277,8 @@ func findArgsStart(text string) int {
 	return pos
 }
 
-// feed accepts one chunk of assistant text and returns the content delta to
-// emit, any tool-call deltas parsed out of it, and whether a complete tool call
-// just finished.
+// feed takes one chunk and returns the content delta to emit, any tool-call
+// deltas parsed from it, and whether a call just completed.
 func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCalls []map[string]interface{}, finishToolCalls bool) {
 	a.buf.WriteString(chunk)
 	data := a.buf.String()
@@ -304,7 +299,7 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
 
 			jsonText := rawData[:jsonEnd]
 
-			// Fallback mode: buffer everything and parse once at the end.
+			// Fallback: buffer it all and parse once at the end.
 			if a.tcFallback {
 				if !complete {
 					return
@@ -343,7 +338,7 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
 				continue
 			}
 
-			// Streaming mode, phase 1: extract and emit the name header.
+			// Phase 1: extract and emit the name header.
 			if !a.tcNameFound {
 				name, _ := tryExtractName(jsonText)
 				if name != "" {
@@ -365,7 +360,7 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
 				}
 			}
 
-			// Phase 2: locate the start of the arguments value.
+			// Phase 2: find where the arguments value begins.
 			if a.tcNameFound && !a.tcArgsFound && !a.tcArgsDone {
 				argsPos := findArgsStart(jsonText)
 				if argsPos >= 0 {
@@ -378,13 +373,13 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
 				} else if !complete {
 					return
 				} else {
-					// Complete, but no object arguments: fall back.
+					// Complete but the arguments are not an object: fall back.
 					a.tcFallback = true
 					continue
 				}
 			}
 
-			// Phase 3: stream the argument bytes incrementally.
+			// Phase 3: stream argument bytes as they arrive.
 			if a.tcArgsFound && !a.tcArgsDone {
 				var streamEnd int
 				if complete {
@@ -447,7 +442,7 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
 				}
 			}
 
-			// Phase 4: finalise.
+			// Phase 4: close the call out.
 			if complete {
 				if !a.tcNameFound {
 					a.tcFallback = true
@@ -468,9 +463,8 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
 
 		relIdx := strings.Index(data[a.flushed:], agentToolCallStart)
 		if relIdx < 0 {
-			// Emit everything but a tail that could still be a partial marker.
-			// The cut backs up to a rune boundary; splitting a multi-byte
-			// character would render as replacement-char garble (issue #23).
+			// Emit all but a tail that could still be a partial marker, cutting
+			// on a rune boundary so nothing garbles as U+FFFD (issue #23).
 			safe := len(data) - a.flushed
 			tail := len(agentToolCallStart) - 1
 			if safe > tail {
@@ -498,8 +492,8 @@ func (a *agentStreamInterceptor) feed(chunk string) (contentDelta string, toolCa
 	}
 }
 
-// flushFinal emits any remaining buffered content at stream end, or "" if the
-// stream stopped mid-tool-call, in which case the partial block is discarded.
+// flushFinal emits what is left at stream end, or "" if the stream stopped
+// mid-call, in which case the partial block is discarded.
 func (a *agentStreamInterceptor) flushFinal() string {
 	if a.emitting {
 		return ""
@@ -513,8 +507,7 @@ func (a *agentStreamInterceptor) flushFinal() string {
 	return rem
 }
 
-// extractAgentToolCalls parses every tool-call block in text into OpenAI
-// tool_calls entries.
+// extractAgentToolCalls parses every block in text into tool_calls entries.
 func extractAgentToolCalls(text string) []map[string]interface{} {
 	var out []map[string]interface{}
 	idx := 0
@@ -556,8 +549,7 @@ func extractAgentToolCalls(text string) []map[string]interface{} {
 	return out
 }
 
-// stripAgentToolCallBlocks removes every tool-call block, returning the
-// trimmed residual content.
+// stripAgentToolCallBlocks removes them all, returning the trimmed remainder.
 func stripAgentToolCallBlocks(text string) string {
 	var sb strings.Builder
 	idx := 0

@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"sort"
 	"strconv"
@@ -22,10 +24,9 @@ import (
 	"unicode/utf8"
 )
 
-// ============================================================================
-// Z.AI SIGNATURE GENERATION
-// ============================================================================
-
+// generateZaSignature signs a prompt the way the Z.AI web client does: the
+// signing key is derived from the salt and a 5-minute time bucket, so a
+// signature only stays valid inside its bucket.
 func generateZaSignature(prompt, token, userID string) (signature, timestamp, urlParams string) {
 	tsMs := time.Now().UnixMilli()
 	timestamp = strconv.FormatInt(tsMs, 10)
@@ -77,10 +78,8 @@ func generateZaSignature(prompt, token, userID string) (signature, timestamp, ur
 	return
 }
 
-// ============================================================================
-// JWT DECODE
-// ============================================================================
-
+// decodeJWT reads the id and a display name out of a token payload without
+// verifying it; the upstream server is the only thing that trusts this token.
 func decodeJWT(token string) (id, name string) {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
@@ -103,10 +102,8 @@ func decodeJWT(token string) (id, name string) {
 	return id, name
 }
 
-// ============================================================================
-// Z.AI SESSION INITIALIZATION
-// ============================================================================
-
+// scrapeConfig picks the frontend version out of the Z.AI home page. Failure is
+// not fatal: the default feVersion still works.
 func scrapeConfig() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -131,9 +128,9 @@ func scrapeConfig() {
 	}
 }
 
-// initializeSession establishes (or refreshes) the upstream Z.AI session.
-// Concurrent callers all observe the same outcome: the first performs the
-// handshake, the rest block on a broadcast channel and receive its error.
+// initializeSession establishes or refreshes the upstream session. Concurrent
+// callers share one handshake: the first runs it, the rest block on a broadcast
+// channel and get its result.
 func initializeSession() error {
 	session.mu.Lock()
 	if wait := session.initWait; wait != nil {
@@ -161,9 +158,9 @@ func initializeSession() error {
 	return err
 }
 
-// doInitializeSession performs the handshake. Shared session fields are read
-// concurrently by /status, DeleteZAIChat and the request path, so every write
-// here holds session.mu.
+// doInitializeSession performs the handshake. /status, DeleteZAIChat and the
+// request path all read session fields concurrently, so every write holds
+// session.mu.
 func doInitializeSession() error {
 	if config.ZaiToken != "" {
 		logInfof("[Session] Using ZAI_TOKEN from the environment, skipping guest init.")
@@ -201,18 +198,28 @@ func doInitializeSession() error {
 		"Content-Type": "application/json",
 	}
 
-	// Fire-and-forget: this primes the anti-bot cookies.
+	// Only the cookies matter, but the body must still be closed: leaving it open
+	// holds a connection out of the pool, and this reruns on every upstream 401.
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel1()
-	req1, _ := http.NewRequestWithContext(ctx1, "POST", BASE_URL+"/api/v1/auths/guest", strings.NewReader("{}"))
+	req1, err := http.NewRequestWithContext(ctx1, "POST", BASE_URL+"/api/v1/auths/guest", strings.NewReader("{}"))
+	if err != nil {
+		return err
+	}
 	for k, v := range headers {
 		req1.Header.Set(k, v)
 	}
-	zaiHTTPClient.Do(req1)
+	if resp1, err := zaiHTTPClient.Do(req1); err == nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp1.Body, 1<<16))
+		resp1.Body.Close()
+	}
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel2()
-	req2, _ := http.NewRequestWithContext(ctx2, "GET", BASE_URL+"/api/v1/auths/", nil)
+	req2, err := http.NewRequestWithContext(ctx2, "GET", BASE_URL+"/api/v1/auths/", nil)
+	if err != nil {
+		return err
+	}
 	for k, v := range headers {
 		req2.Header.Set(k, v)
 	}
@@ -231,7 +238,7 @@ func doInitializeSession() error {
 
 	if resp.StatusCode != 200 {
 		resp.Body.Close()
-		return markSessionFailed(fmt.Errorf("Auth failed: %d", resp.StatusCode))
+		return markSessionFailed(fmt.Errorf("auth failed: %d", resp.StatusCode))
 	}
 
 	var authData struct {
@@ -260,7 +267,7 @@ func doInitializeSession() error {
 	}
 
 	if token == "" {
-		return markSessionFailed(errors.New("No token received from Z.AI"))
+		return markSessionFailed(errors.New("no token received from Z.AI"))
 	}
 
 	id, name := decodeJWT(token)
@@ -282,14 +289,9 @@ func doInitializeSession() error {
 	return nil
 }
 
-// ============================================================================
-// Z.AI COMMUNICATION
-// ============================================================================
-
 // sendToZAI starts one upstream completion and returns its result stream.
-// ctx governs the whole exchange: cancelling it (client disconnect, handler
-// error, request timeout) tears down the upstream request and unblocks the
-// producer goroutine.
+// Cancelling ctx (client disconnect, handler error, timeout) tears down the
+// upstream request and unblocks the producer goroutine.
 func sendToZAI(ctx context.Context, prompt string, opts SendOptions) (<-chan ZAIResult, error) {
 	session.mu.Lock()
 	defaultChatID := session.ChatID
@@ -304,7 +306,7 @@ func sendToZAI(ctx context.Context, prompt string, opts SendOptions) (<-chan ZAI
 
 	featuresMap := resolveFeaturesForModel(model)
 
-	// Per-request overrides take highest precedence.
+	// Per-request overrides win over everything resolved above.
 	if opts.WebSearch != nil {
 		if *opts.WebSearch {
 			featuresMap["auto_web_search"] = true
@@ -324,16 +326,15 @@ func sendToZAI(ctx context.Context, prompt string, opts SendOptions) (<-chan ZAI
 		featuresMap["preview_mode"] = *opts.PreviewMode
 	}
 
-	// Models that do not support reasoning_effort malfunction if they receive
-	// it, so any stale value is stripped before the opt-in check below.
+	// Models without reasoning_effort support malfunction if they receive it,
+	// so strip any stale value before the opt-in check below.
 	delete(featuresMap, "reasoning_effort")
 
 	if opts.ReasoningEffort != "" {
 		if modelSupportsReasoningEffort(model) {
 			if isValidReasoningEffort(opts.ReasoningEffort) {
 				featuresMap["reasoning_effort"] = opts.ReasoningEffort
-				// reasoning_effort requires thinking; a user override of
-				// enable_thinking is ignored here.
+				// Requires thinking, so a user override is ignored here.
 				featuresMap["enable_thinking"] = true
 				logInfo(fmt.Sprintf(
 					"[reasoning_effort] model=%s effort=%s enabled (enable_thinking forced true)",
@@ -350,8 +351,7 @@ func sendToZAI(ctx context.Context, prompt string, opts SendOptions) (<-chan ZAI
 		}
 	}
 
-	// Only enable_thinking reaches the request, and image_generation is never
-	// enabled on this endpoint.
+	// Only enable_thinking reaches the wire, and image_generation never does.
 	delete(featuresMap, "think")
 	featuresMap["image_generation"] = false
 
@@ -422,10 +422,14 @@ func sendToZAIStream(ctx context.Context, prompt string, opts struct {
 
 		var messagesField interface{}
 		if len(opts.ClientMessagesRaw) > 0 {
-			messagesField = json.RawMessage(opts.ClientMessagesRaw)
+			messagesField = json.RawMessage(processImagesForZAI(ctx, []byte(opts.ClientMessagesRaw), token))
 		} else {
-			forwarded := make([]Message, 0, len(opts.Messages)+1)
-			forwarded = append(forwarded, opts.Messages...)
+			rawMsgs, _ := json.Marshal(opts.Messages)
+			var moddedMsgs []Message
+			_ = json.Unmarshal(processImagesForZAI(ctx, rawMsgs, token), &moddedMsgs)
+
+			forwarded := make([]Message, 0, len(moddedMsgs)+1)
+			forwarded = append(forwarded, moddedMsgs...)
 			promptJSON, _ := json.Marshal(prompt)
 			forwarded = append(forwarded, Message{Role: "user", Content: json.RawMessage(promptJSON)})
 			messagesField = forwarded
@@ -460,7 +464,9 @@ func sendToZAIStream(ctx context.Context, prompt string, opts struct {
 			logDebugf("Z.AI url %s", urlStr)
 			logDebugf("Z.AI request body: %s", string(bodyBytes))
 			hdrMap := map[string]string{
-				"authorization": "Bearer " + token,
+				// Never the real bearer: with ZAI_TOKEN set this is the account
+				// credential, and debug logs get pasted into issues.
+				"authorization": "Bearer " + redactSecret(token),
 				"content-type":  "application/json",
 				"x-fe-Version":  feVersion,
 				"x-region":      "overseas",
@@ -535,30 +541,305 @@ func sendToZAIStream(ctx context.Context, prompt string, opts struct {
 		}
 		return err
 	}
-	return errors.New("Max retries exceeded")
+	return errors.New("max retries exceeded")
 }
 
-// extractZAIError inspects a parsed Z.AI SSE payload for an embedded error
-// (Z.AI sometimes returns HTTP 200 with the error inside the JSON body).
-// Returns the human-readable detail string, or "" if no error is present.
+// extractZAIError returns an embedded error detail, or "" if there is none.
+// Z.AI sometimes answers HTTP 200 with the error inside the JSON body.
 func extractZAIError(j map[string]interface{}) string {
 	if data, ok := j["data"].(map[string]interface{}); ok {
 		if detail := zaiErrorDetail(data["error"], true); detail != "" {
 			return detail
 		}
-		// Nested variant observed in production.
+		// A nested variant seen in production.
 		if nested, ok := data["data"].(map[string]interface{}); ok {
 			if detail := zaiErrorDetail(nested["error"], true); detail != "" {
 				return detail
 			}
 		}
 	}
-	// Top-level error, for shapes that are not Z.AI's own.
+	// Top-level, for shapes that are not Z.AI's own.
 	return zaiErrorDetail(j["error"], false)
 }
 
-// zaiErrorDetail pulls the human-readable message out of an error object,
-// optionally appending the numeric code Z.AI attaches to its own errors.
+const (
+	// Each image is uploaded separately, so the count bounds request duration
+	// as much as memory.
+	maxUploadImageBytes = 24 << 20
+	maxImagesPerRequest = 10
+)
+
+// normalizeImageMIME collapses a MIME type to a supported value, so no client string
+// reaches a header verbatim.
+func normalizeImageMIME(mime string) string {
+	// A remote content-type may carry parameters ("image/jpeg; charset=utf-8"),
+	// which would otherwise fall through and be relabelled as PNG.
+	if semi := strings.IndexByte(mime, ';'); semi >= 0 {
+		mime = mime[:semi]
+	}
+	switch strings.ToLower(strings.TrimSpace(mime)) {
+	case "image/jpeg", "image/jpg":
+		return "image/jpeg"
+	case "image/webp":
+		return "image/webp"
+	case "image/gif":
+		return "image/gif"
+	case "image/bmp":
+		return "image/bmp"
+	default:
+		return "image/png"
+	}
+}
+
+func imageExtForMIME(mime string) string {
+	switch mime {
+	case "image/jpeg", "image/jpg":
+		return ".jpg"
+	case "image/webp":
+		return ".webp"
+	case "image/gif":
+		return ".gif"
+	case "image/bmp":
+		return ".bmp"
+	default:
+		return ".png"
+	}
+}
+
+func bodySnippet(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > 300 {
+		return s[:300] + "..."
+	}
+	return s
+}
+
+// uploadImageToZAI turns an inline image (data URI, bare base64 or remote URL)
+// into a Z.AI-hosted file, returning its id and signed CDN URL. The completions
+// endpoint rejects inline base64, so images must be uploaded and referenced.
+func uploadImageToZAI(ctx context.Context, imgData, token string) (fileID, cdnURL string, err error) {
+	var fileData []byte
+	mimeType := "image/png"
+
+	switch {
+	case strings.HasPrefix(imgData, "http://"), strings.HasPrefix(imgData, "https://"):
+		req, rerr := http.NewRequestWithContext(ctx, "GET", imgData, nil)
+		if rerr != nil {
+			return "", "", rerr
+		}
+		if rerr := validateFetchTarget(req.URL); rerr != nil {
+			return "", "", rerr
+		}
+		resp, rerr := imageFetchClient.Do(req)
+		if rerr != nil {
+			return "", "", rerr
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return "", "", fmt.Errorf("fetch image: HTTP %d", resp.StatusCode)
+		}
+		fileData, rerr = io.ReadAll(io.LimitReader(resp.Body, maxUploadImageBytes))
+		if rerr != nil {
+			return "", "", rerr
+		}
+		if ct := resp.Header.Get("content-type"); strings.HasPrefix(ct, "image/") {
+			mimeType = ct
+		}
+
+	case strings.HasPrefix(imgData, "data:"):
+		comma := strings.Index(imgData, ",")
+		if comma == -1 {
+			return "", "", fmt.Errorf("invalid data URI")
+		}
+		if semi := strings.Index(imgData[:comma], ";"); semi > len("data:") {
+			mimeType = imgData[len("data:"):semi]
+		}
+		fileData, err = base64.StdEncoding.DecodeString(imgData[comma+1:])
+		if err != nil {
+			return "", "", fmt.Errorf("decode data URI: %w", err)
+		}
+
+	default:
+		fileData, err = base64.StdEncoding.DecodeString(imgData)
+		if err != nil {
+			return "", "", fmt.Errorf("decode base64 image: %w", err)
+		}
+	}
+
+	if len(fileData) == 0 {
+		return "", "", fmt.Errorf("image payload is empty")
+	}
+	// The remote branch caps as it reads; the decode branches can only be checked
+	// after the fact, so the same limit lands on all three.
+	if int64(len(fileData)) > maxUploadImageBytes {
+		return "", "", fmt.Errorf("image is %d bytes, over the %d byte limit",
+			len(fileData), int64(maxUploadImageBytes))
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	hdr := make(textproto.MIMEHeader)
+	// Normalised, not passed through: multipart does not sanitise header values, so a
+	// CR/LF from the client's data URI would inject headers into the upstream body.
+	mimeType = normalizeImageMIME(mimeType)
+	hdr.Set("Content-Disposition",
+		fmt.Sprintf(`form-data; name="file"; filename=%q`, "image"+imageExtForMIME(mimeType)))
+	hdr.Set("Content-Type", mimeType)
+	part, err := writer.CreatePart(hdr)
+	if err != nil {
+		return "", "", err
+	}
+	if _, err = part.Write(fileData); err != nil {
+		return "", "", err
+	}
+	if err = writer.WriteField("purpose", "vision"); err != nil {
+		return "", "", err
+	}
+	if err = writer.Close(); err != nil {
+		return "", "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", BASE_URL+"/api/v1/files/", body)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("authorization", "Bearer "+token)
+	req.Header.Set("content-type", writer.FormDataContentType())
+	req.Header.Set("user-agent", zaiUserAgent)
+	req.Header.Set("origin", BASE_URL)
+	req.Header.Set("referer", BASE_URL+"/")
+
+	resp, err := zaiHTTPClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "", "", fmt.Errorf("upload rejected: HTTP %d: %s", resp.StatusCode, bodySnippet(raw))
+	}
+
+	var resData struct {
+		ID   string `json:"id"`
+		Meta struct {
+			CDNURL string `json:"cdn_url"`
+		} `json:"meta"`
+	}
+	if err = json.Unmarshal(raw, &resData); err != nil {
+		return "", "", fmt.Errorf("upload response parse: %w (body: %s)", err, bodySnippet(raw))
+	}
+	if resData.ID == "" {
+		return "", "", fmt.Errorf("upload returned no file id (body: %s)", bodySnippet(raw))
+	}
+
+	logInfof("[Image] uploaded %d bytes (%s) as %s", len(fileData), mimeType, resData.ID)
+	return resData.ID, resData.Meta.CDNURL, nil
+}
+
+// processImagesForZAI replaces inline image parts with Z.AI-hosted image_url
+// references. Images already served over https pass through untouched.
+func processImagesForZAI(ctx context.Context, messagesRaw []byte, token string) []byte {
+	var msgs []map[string]interface{}
+	if err := json.Unmarshal(messagesRaw, &msgs); err != nil {
+		return messagesRaw
+	}
+	changed := false
+
+	for i, msg := range msgs {
+		content, ok := msg["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		newContent := make([]interface{}, 0, len(content))
+		msgChanged := false
+		for _, partRaw := range content {
+			part, ok := partRaw.(map[string]interface{})
+			if !ok {
+				newContent = append(newContent, partRaw)
+				continue
+			}
+			partType, _ := part["type"].(string)
+			var urlStr string
+			switch partType {
+			case "image_url":
+				if imgURLObj, ok := part["image_url"].(map[string]interface{}); ok {
+					urlStr, _ = imgURLObj["url"].(string)
+				}
+			case "input_image":
+				if src, ok := part["source"].(map[string]interface{}); ok {
+					if mediaType, _ := src["media_type"].(string); mediaType != "" {
+						if data, _ := src["data"].(string); data != "" {
+							urlStr = "data:" + mediaType + ";base64," + data
+						}
+					}
+				}
+				if urlStr == "" {
+					urlStr, _ = part["url"].(string)
+				}
+			default:
+				newContent = append(newContent, part)
+				continue
+			}
+			if urlStr == "" {
+				newContent = append(newContent, part)
+				continue
+			}
+			if strings.HasPrefix(urlStr, "https://") && !strings.Contains(urlStr, "base64") {
+				newContent = append(newContent, map[string]interface{}{
+					"type":      "image_url",
+					"image_url": map[string]string{"url": urlStr},
+				})
+				continue
+			}
+
+			id, cdn, err := uploadImageToZAI(ctx, urlStr, token)
+			if err != nil || id == "" {
+				// Carries the client's URL and an upstream body snippet.
+				logErrorf("[Image] upload failed: %s", printableASCII(fmt.Sprint(err)))
+				newContent = append(newContent, map[string]interface{}{
+					"type": "text",
+					"text": "[Image could not be processed]",
+				})
+				msgChanged = true
+				continue
+			}
+			ref := cdn
+			if ref == "" {
+				ref = BASE_URL + "/api/v1/files/" + id + "/content"
+			}
+			newContent = append(newContent, map[string]interface{}{
+				"type":      "image_url",
+				"image_url": map[string]string{"url": ref},
+			})
+			msgChanged = true
+		}
+		if msgChanged {
+			changed = true
+			if len(newContent) == 1 {
+				if textPart, ok := newContent[0].(map[string]interface{}); ok {
+					if textPart["type"] == "text" {
+						msgs[i]["content"] = textPart["text"]
+						continue
+					}
+				}
+			}
+			msgs[i]["content"] = newContent
+		}
+	}
+
+	if !changed {
+		return messagesRaw
+	}
+	newRaw, err := json.Marshal(msgs)
+	if err != nil {
+		return messagesRaw
+	}
+	return newRaw
+}
+
+// zaiErrorDetail pulls the readable message out of an error object, optionally
+// appending the numeric code Z.AI attaches to its own.
 func zaiErrorDetail(v interface{}, withCode bool) string {
 	errObj, ok := v.(map[string]interface{})
 	if !ok {
@@ -579,7 +860,7 @@ func zaiErrorDetail(v interface{}, withCode bool) string {
 	return detail
 }
 
-// statusFromError maps a Z.AI/bridge error string to an HTTP status code.
+// statusFromError maps an error string onto an HTTP status.
 func statusFromError(errMsg string) int {
 	switch {
 	case strings.Contains(errMsg, "401"):
@@ -595,11 +876,10 @@ func statusFromError(errMsg string) int {
 	}
 }
 
-// utf16IndexToByteIndex converts a UTF-16 code-unit offset into a byte offset
-// within s. That is JavaScript string indexing, which is what the Z.AI web
-// frontend uses for edit_index. The result clamps at the end of s and never
-// lands inside a multi-byte rune: an offset between the two units of a
-// surrogate pair is clamped to the start of that rune.
+// utf16IndexToByteIndex converts a UTF-16 code-unit offset to a byte offset.
+// That is JavaScript string indexing, which is what Z.AI's frontend uses for
+// edit_index. The result clamps to the end of s and to rune starts, so an offset
+// landing between the halves of a surrogate pair cannot split it.
 func utf16IndexToByteIndex(s string, utf16Idx int) int {
 	if utf16Idx <= 0 {
 		return 0
@@ -623,8 +903,8 @@ func utf16IndexToByteIndex(s string, utf16Idx int) int {
 	return len(s)
 }
 
-// utf16IndexToByteIndexBytes is utf16IndexToByteIndex over the raw accumulator,
-// so the streaming path never materialises it as a string to locate an offset.
+// utf16IndexToByteIndexBytes is the same over the raw accumulator, so the stream
+// path never materialises a string just to find an offset.
 func utf16IndexToByteIndexBytes(b []byte, utf16Idx int) int {
 	if utf16Idx <= 0 {
 		return 0
@@ -648,9 +928,8 @@ func utf16IndexToByteIndexBytes(b []byte, utf16Idx int) int {
 	return len(b)
 }
 
-// commonPrefixLen returns the byte length of the longest common prefix of
-// a and b. The result is always on a rune boundary, so slicing either
-// string at that offset cannot produce invalid UTF-8.
+// commonPrefixLen returns the byte length of the longest common prefix of a and
+// b, always on a rune boundary so slicing either there stays valid UTF-8.
 func commonPrefixLen(a, b string) int {
 	i := 0
 	for i < len(a) && i < len(b) {
@@ -664,7 +943,7 @@ func commonPrefixLen(a, b string) int {
 	return i
 }
 
-// holdBackTail trims up to n runes from the end of s (rune-safe).
+// holdBackTail trims up to n runes off the end of s, on rune boundaries.
 func holdBackTail(s string, n int) string {
 	if n <= 0 || s == "" {
 		return s
@@ -678,11 +957,10 @@ func holdBackTail(s string, n int) string {
 	return s[:i]
 }
 
-// holdBackPartialDetailsTag trims a trailing fragment that could still be
-// the beginning of a <details> tag whose completion has not arrived yet,
-// so a tag streamed character by character never leaks to the client.
-// A COMPLETE "</details>" literal is kept (legitimate text); a complete
-// "<details" is held (waiting for its ">" to decide whether it is a tag).
+// holdBackPartialDetailsTag trims a trailing fragment that could still grow
+// into a <details> tag, so one streamed character by character never leaks.
+// A complete "</details>" is kept as legitimate text; a complete "<details" is
+// held until its ">" arrives and settles whether it is a tag.
 func holdBackPartialDetailsTag(s string) string {
 	i := strings.LastIndex(s, "<")
 	if i < 0 {
@@ -698,12 +976,12 @@ func holdBackPartialDetailsTag(s string) string {
 	return s
 }
 
-// holdBackPartialQuoteMarker trims a trailing ">" that forms the whole last
-// line of s. Reasoning lines are markdown-quoted ("> ..."), so mid-stream a
-// new line's marker appears as a bare ">" that stripDetailsTags cannot strip
-// until the space arrives. Forwarding it makes the stripped snapshot sequence
-// non-monotonic, which diverges the reasoning emitter and duplicates
-// everything after that point. The final flush releases it.
+// holdBackPartialQuoteMarker trims a trailing ">" that forms the whole last line
+// of s. Reasoning lines are markdown-quoted, so mid-stream a new line's marker
+// arrives as a bare ">" that stripDetailsTags cannot strip until its space
+// follows. Forwarding it makes the stripped snapshots non-monotonic, diverging
+// the reasoning emitter and duplicating everything after that point. The final
+// flush releases it.
 func holdBackPartialQuoteMarker(s string) string {
 	if !strings.HasSuffix(s, ">") {
 		return s
@@ -715,25 +993,22 @@ func holdBackPartialQuoteMarker(s string) string {
 	return s
 }
 
-// sseEmitter forwards snapshots of a growing (and occasionally rewritten) text
-// to an append-only consumer as rune-safe deltas. It never emits a slice that
-// starts inside a multi-byte rune, so the consumer cannot receive invalid UTF-8
-// — which its JSON renderer would show as U+FFFD garble (issue #23).
+// sseEmitter forwards snapshots of a growing, occasionally rewritten text to an
+// append-only consumer as rune-safe deltas. It never starts a slice inside a
+// multi-byte rune, which would reach the client as U+FFFD garble (issue #23).
 type sseEmitter struct {
 	clientView string // exactly what the consumer has received so far
 }
 
-// delta returns the text to append so the consumer converges on target, and
-// updates the tracked view:
+// delta returns the text to append for the consumer to converge on target:
 //   - target extends the view: the new suffix.
-//   - target is a prefix of the view (a deep edit truncated the text): nothing,
-//     since an append-only consumer cannot take text back. The view is kept so
-//     later growth is not re-sent from a rewound base.
-//   - target rewrote part of the view: everything after the longest common
-//     prefix. The stale fragment in between stays on the consumer, which is
-//     unavoidable here but remains valid UTF-8. The view then re-syncs to
-//     target, because keeping the stale fragment would make every later
-//     snapshot diverge at the same point and re-emit the rest each time.
+//   - target is a prefix of the view (a deep edit truncated it): nothing, since
+//     an append-only consumer cannot take text back. The view is kept so later
+//     growth is not re-sent from a rewound base.
+//   - target rewrote part of the view: everything after the common prefix. The
+//     stale fragment in between is unavoidable but stays valid UTF-8, and the
+//     view re-syncs to target — keeping it would make every later snapshot
+//     diverge at the same point and re-emit the rest each time.
 func (e *sseEmitter) delta(target string) string {
 	if target == e.clientView {
 		return ""
@@ -752,10 +1027,8 @@ func (e *sseEmitter) delta(target string) string {
 	return delta
 }
 
-// splitDetails extracts every complete <details ...>...</details> block
-// from raw: the block bodies (concatenated) become reasoning, everything
-// else becomes content. A trailing opener whose '>' has not arrived yet is
-// held pending (neither reasoning nor content) until more data arrives.
+// splitDetails sorts raw into reasoning (the concatenated bodies of complete
+// <details ...>...</details> blocks) and content (everything else).
 func splitDetails(raw string) (reasoning, content string) {
 	var s detailsSplitter
 	return s.finish([]byte(raw))
@@ -771,12 +1044,11 @@ var (
 	detailsCloseB = []byte(detailsClose)
 )
 
-// detailsSplitter is the resumable form of splitDetails, used by the streaming
-// path where the accumulated buffer is re-classified on every SSE event.
-// Re-splitting the whole buffer each time would make the per-event cost grow
-// with the response; this remembers how far it consumed and appends only the
-// new bytes. Both accumulators are strings.Builders, whose String() aliases
-// the existing buffer, so a steady-state event allocates nothing.
+// detailsSplitter is the resumable form of splitDetails for the streaming path.
+// Re-splitting the whole buffer on every SSE event would make the per-event cost
+// grow with the response, so this remembers how far it consumed and appends only
+// new bytes. Builder.String() aliases its buffer, so a steady-state event
+// allocates nothing.
 type detailsSplitter struct {
 	reasoning strings.Builder
 	content   strings.Builder
@@ -785,8 +1057,8 @@ type detailsSplitter struct {
 	tail      tailKind
 }
 
-// tailKind records why feed stopped, so finish() can release the withheld
-// tail into the same bucket the one-shot splitter would have put it in.
+// tailKind records why feed stopped, so finish releases the withheld tail into
+// the bucket the one-shot splitter would have chosen.
 type tailKind uint8
 
 const (
@@ -803,9 +1075,9 @@ func (s *detailsSplitter) reset() {
 	s.tail = tailContent
 }
 
-// feed classifies the unconsumed tail of raw and returns the full reasoning
-// and content snapshots. raw must extend what was previously fed; callers call
-// reset() first when the buffer was rewritten behind s.consumed.
+// feed classifies the unconsumed tail and returns both full snapshots. raw must
+// extend what was fed before; call reset first if the buffer was rewritten behind
+// s.consumed.
 func (s *detailsSplitter) feed(raw []byte) (reasoning, content string) {
 	s.tail = tailContent
 	for s.consumed < len(raw) {
@@ -814,11 +1086,9 @@ func (s *detailsSplitter) feed(raw []byte) (reasoning, content string) {
 		if s.inDetails {
 			closeIdx := bytes.Index(rest, detailsCloseB)
 			if closeIdx < 0 {
-				// Body still streaming. Hold back a trailing fragment that
-				// could still grow into the closing tag: consuming it would
-				// put "</detai" into the reasoning accumulator, which is
-				// append-only and could not take it back once the tag
-				// completed.
+				// Still streaming. Hold back a fragment that could grow into
+				// the closing tag: the reasoning accumulator is append-only, so
+				// a premature "</detai" could never be taken back.
 				keep := len(rest) - partialTagSuffixLen(rest, detailsCloseB)
 				s.reasoning.Write(rest[:keep])
 				s.consumed += keep
@@ -833,8 +1103,7 @@ func (s *detailsSplitter) feed(raw []byte) (reasoning, content string) {
 
 		idx := bytes.Index(rest, detailsOpenB)
 		if idx < 0 {
-			// Same reasoning as above for a fragment that could grow into an
-			// opening tag.
+			// Same again, for a fragment that could grow into an opening tag.
 			keep := len(rest) - partialTagSuffixLen(rest, detailsOpenB)
 			s.content.Write(rest[:keep])
 			s.consumed += keep
@@ -855,9 +1124,8 @@ func (s *detailsSplitter) feed(raw []byte) (reasoning, content string) {
 	return s.reasoning.String(), s.content.String()
 }
 
-// finish classifies everything left over, including fragments that feed held
-// back in case they were the start of a tag. Used for the final flush, where
-// nothing more is coming and a withheld fragment is just text.
+// finish is the final flush: nothing more is coming, so fragments feed held back
+// as possible tag starts are just text and get released.
 func (s *detailsSplitter) finish(raw []byte) (reasoning, content string) {
 	reasoning, content = s.feed(raw)
 	if s.consumed >= len(raw) {
@@ -869,16 +1137,15 @@ func (s *detailsSplitter) finish(raw []byte) (reasoning, content string) {
 	case tailContent:
 		s.content.Write(raw[s.consumed:])
 	case tailDropped:
-		// An opener that never completed is not text; the one-shot splitter
-		// discards it too.
+		// An opener that never completed is not text; the one-shot splitter drops
+		// it too.
 	}
 	s.consumed = len(raw)
 	return s.reasoning.String(), s.content.String()
 }
 
-// partialTagSuffixLen returns the length of the suffix of s that is a
-// non-empty prefix of tag but not the whole tag — the fragment of a tag that
-// is still arriving. A complete tag returns 0 because it needs no holding.
+// partialTagSuffixLen returns how many trailing bytes of s form an incomplete
+// prefix of tag, i.e. a tag still arriving. A complete tag returns 0.
 func partialTagSuffixLen(s, tag []byte) int {
 	max := len(tag) - 1
 	if max > len(s) {
@@ -896,8 +1163,7 @@ func partialTagSuffixLen(s, tag []byte) int {
 }
 
 // stripDetailsTags removes the leading <details ...> opener, every </details>
-// closer, and the leading "> " markdown-quote prefix of each line, in a single
-// pass into one pre-sized builder.
+// closer and each line's "> " quote prefix, in one pass into a pre-sized builder.
 func stripDetailsTags(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -931,10 +1197,10 @@ func stripDetailsTags(s string) string {
 	return strings.TrimSpace(b.String())
 }
 
-// detailsStripCache memoises stripDetailsTags across SSE events. Once the
-// model stops thinking the reasoning text is frozen while content keeps
-// streaming, so most events can skip the work entirely. The snapshot aliases a
-// strings.Builder buffer, making the equality check a pointer comparison.
+// detailsStripCache memoises stripDetailsTags across SSE events. Once the model
+// stops thinking, reasoning is frozen while content keeps streaming, so most
+// events skip the work. The snapshot aliases a Builder buffer, so the equality
+// check is effectively a pointer comparison.
 type detailsStripCache struct {
 	src    string
 	result string
@@ -950,22 +1216,20 @@ func (c *detailsStripCache) strip(s string) string {
 }
 
 func streamSSEResponse(ctx context.Context, body io.Reader, ch chan<- ZAIResult) error {
-	// bufio.Reader rather than bufio.Scanner: Z.AI sends full-content
-	// replacements, so a single data: line grows with the answer and Scanner
-	// would abort with ErrTooLong once it passed its maximum token size.
+	// Reader, not Scanner: Z.AI sends full-content replacements, so one data:
+	// line grows with the answer and Scanner would abort with ErrTooLong.
 	reader := bufio.NewReaderSize(body, 64*1024)
 
-	// A byte accumulator rather than a strings.Builder, because edit_content
-	// truncates the buffer and Builder cannot truncate without discarding it.
+	// A byte slice, not a Builder: edit_content truncates, and Builder cannot
+	// truncate without discarding everything.
 	rawBuf := make([]byte, 0, 8*1024)
 	var splitter detailsSplitter
 	var stripCache detailsStripCache
 	contentEmitter := &sseEmitter{}   // tracks what the client has received
 	reasoningEmitter := &sseEmitter{} // same for the reasoning channel
 
-	// send blocks until the consumer takes the result or the request is
-	// cancelled, so a handler that stops reading cannot park this goroutine
-	// on the channel with the upstream body still open.
+	// send waits for the consumer or for cancellation, so a handler that stops
+	// reading cannot park this goroutine with the upstream body still open.
 	send := func(r ZAIResult) bool {
 		select {
 		case ch <- r:
@@ -977,7 +1241,6 @@ func streamSSEResponse(ctx context.Context, body io.Reader, ch chan<- ZAIResult)
 	}
 
 	flush := func(final bool) bool {
-		// Split <details ...> ... </details> into reasoning vs content.
 		var reasoning, content string
 		if final {
 			reasoning, content = splitter.finish(rawBuf)
@@ -988,17 +1251,11 @@ func streamSSEResponse(ctx context.Context, body io.Reader, ch chan<- ZAIResult)
 			reasoning = stripCache.strip(reasoning)
 		}
 
-		// Emit reasoning delta (prefix-aware, rune-safe). Reasoning rides
-		// the same edit-based stream as content, so while the stream is
-		// live it gets the same protection: hold back a small tail so
-		// trailing edit_content backtracks are absorbed invisibly, hold
-		// back a partial </details> close tag streamed character by
-		// character (splitDetails folds it into the reasoning body until
-		// it completes, so forwarding it would leak the fragment and
-		// then rewind the snapshot), and hold back a partially-streamed
-		// "> " quote marker that a later character would strip again
-		// (non-monotonic snapshots diverge the emitter and duplicate
-		// everything after them). The final flush releases everything.
+		// Reasoning rides the same edit-based stream as content, so it needs the
+		// same three guards while the stream is live: absorb trailing
+		// edit_content backtracks, and never forward a partial </details> tag or
+		// quote marker, either of which would rewind a later snapshot and
+		// diverge the emitter. The final flush releases everything.
 		if !final {
 			reasoning = holdBackTail(reasoning, config.StreamHoldback)
 			reasoning = holdBackPartialDetailsTag(reasoning)
@@ -1010,17 +1267,15 @@ func streamSSEResponse(ctx context.Context, body io.Reader, ch chan<- ZAIResult)
 			}
 		}
 
-		// While the stream is live, keep a small tail pending so ordinary
-		// trailing edit_content backtracks are absorbed invisibly, and
-		// never forward a fragment that could still grow into a <details>
-		// tag. The final flush releases everything.
+		// Same for content, minus the quote marker: that only appears inside a
+		// reasoning body.
 		target := content
 		if !final {
 			target = holdBackTail(target, config.StreamHoldback)
 			target = holdBackPartialDetailsTag(target)
 		}
-		// FullText is the authoritative upstream snapshot, used by non-stream
-		// consumers and for deep-edit re-sync detection in the handlers.
+		// FullText is the authoritative snapshot: non-stream consumers and the
+		// handlers' deep-edit re-sync detection both read it.
 		if delta := contentEmitter.delta(target); delta != "" {
 			if !send(ZAIResult{Chunk: delta, FullText: target}) {
 				return false
@@ -1076,9 +1331,8 @@ func streamSSEResponse(ctx context.Context, body io.Reader, ch chan<- ZAIResult)
 	}
 }
 
-// applySSEPayload folds one parsed upstream event into the raw accumulator and
-// reports whether the stream is complete. Content semantics mirror the official
-// Z.AI web frontend (prod-fe bundle):
+// applySSEPayload folds one event into the accumulator and reports whether the
+// stream is done. The mutation shapes mirror Z.AI's own frontend (prod-fe):
 //
 //	edit_content:  content = content.substring(0, edit_index) + edit_content,
 //	               where edit_index is a UTF-16 code-unit offset (JavaScript
@@ -1086,10 +1340,9 @@ func streamSSEResponse(ctx context.Context, body io.Reader, ch chan<- ZAIResult)
 //	content:       full replacement of the accumulated text
 //	delta_content: plain append
 //
-// A mutation that rewrites bytes the splitter already classified forces a
-// rescan; otherwise the splitter resumes where it left off.
+// Rewriting classified bytes forces a rescan; otherwise the splitter resumes.
 func applySSEPayload(j map[string]interface{}, rawBuf *[]byte, splitter *detailsSplitter) (done bool, err error) {
-	// Z.AI sometimes returns HTTP 200 with the error inside the event body.
+	// HTTP 200 with the error inside the event body is a real upstream shape.
 	if errDetail := extractZAIError(j); errDetail != "" {
 		logDebugf("Z.AI inline SSE error: %s", errDetail)
 		metrics.upstreamErrors.Add(1)
@@ -1129,8 +1382,8 @@ func applySSEPayload(j map[string]interface{}, rawBuf *[]byte, splitter *details
 	return false, nil
 }
 
-// stringHasBytesPrefix reports whether s starts with p, without the allocation
-// a []byte-to-string conversion would cost on this path.
+// stringHasBytesPrefix reports whether s starts with p, without the allocation a
+// []byte-to-string conversion would cost here.
 func stringHasBytesPrefix(s string, p []byte) bool {
 	if len(s) < len(p) {
 		return false

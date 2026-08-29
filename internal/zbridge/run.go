@@ -1,12 +1,11 @@
-// Entry point of the Z.AI bridge (package zbridge).
 // Entry point of the Z.AI bridge.
 //
-// Run parses the CLI flags, opens the token database, starts the background
-// workers, serves NewHandler() and blocks until SIGINT/SIGTERM, then drains
-// in-flight requests and clears every still-pooled chat session on Z.AI.
+// Run parses flags, opens the token database, starts the background workers,
+// serves NewHandler() and blocks until SIGINT/SIGTERM, then drains in-flight
+// requests and clears every still-pooled chat session.
 //
-// NewHandler is exported separately so integration tests can drive the full
-// HTTP surface without starting a listener.
+// NewHandler is separate so integration tests can drive the whole HTTP surface
+// without a listener.
 
 package zbridge
 
@@ -30,8 +29,7 @@ import (
 	"time"
 )
 
-// NewHandler assembles the bridge's complete HTTP surface: every route with
-// the auth and CORS middleware applied.
+// NewHandler assembles every route with auth and CORS applied.
 func NewHandler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -44,7 +42,7 @@ func NewHandler() http.Handler {
 	mux.HandleFunc("/v1/messages", authMiddleware(anthropicMessagesHandler))
 	mux.HandleFunc("/features", authMiddleware(featuresHandler))
 	// Authenticated: the listener binds 0.0.0.0 by default, so these would
-	// otherwise expose internal state to anyone who can reach the port.
+	// otherwise hand internal state to anyone who can reach the port.
 	mux.HandleFunc("/admin/stats", authMiddleware(statsHandler))
 	mux.HandleFunc("/admin/health", authMiddleware(healthHandler))
 	mux.HandleFunc("/admin/clients", authMiddleware(clientsHandler))
@@ -55,8 +53,7 @@ func NewHandler() http.Handler {
 	return corsMiddleware(mux)
 }
 
-// Run starts the bridge server and blocks until a fatal error or a
-// termination signal. Called from the root package's main().
+// Run serves until a fatal error or a termination signal.
 func Run() {
 	flag.StringVar(&dbPath, "db-path", "tokens.sqlite", "Path to SQLite database")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
@@ -65,7 +62,7 @@ func Run() {
 	flag.BoolVar(&config.SyncMode, "sync-mode", config.SyncMode, "Legacy synchronous session flow: create a fresh chat per request instead of drawing from the pre-warmed session pool (used sessions are still deleted on Z.AI after each response)")
 	flag.Parse()
 
-	// --verbose is shorthand for LOG_LEVEL=debug.
+	// Shorthand for LOG_LEVEL=debug.
 	if verbose {
 		config.Logging.Level = "debug"
 		setLogLevel("debug")
@@ -76,23 +73,51 @@ func Run() {
 
 	logInfof("Starting with db-path=%q log-level=%s", dbPath, config.Logging.Level)
 
-	// initDB creates the token schema if the file is new, so a fresh install
-	// starts with an empty store and the token monitor fills it in the
-	// background rather than the proxy refusing to start.
+	// initDB creates the schema when the file is new, so a fresh install starts
+	// empty and the monitor fills it rather than the proxy refusing to boot.
 	if err := initDB(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to open database: %v\n", err)
-		os.Exit(1)
+		// The store holds only harvested device tokens, which the monitor refills,
+		// so a corrupt file is not worth refusing to start over: quarantine it and
+		// retry once with a fresh one.
+		if quarantineErr := quarantineTokenDB(); quarantineErr != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open database: %v (could not quarantine: %v)\n", err, quarantineErr)
+			os.Exit(1)
+		}
+		logConsolef("[Tokens] store was unreadable (%v); moved it aside and started fresh.", err)
+		if err := initDB(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to open database after quarantine: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	defer closeDB()
 
+	// Setup fills the store, so an empty one here means that step did not finish.
 	if getTokenCount() == 0 {
-		logConsolef("[Tokens] store is empty; the monitor will collect the first batch now (first run downloads a browser, ~1-2 min).")
+		logConsolef("[Tokens] store is empty, so the monitor is collecting a batch now; " +
+			"the first request waits for it rather than failing.")
+	}
+
+	// The shipped keys are public, so on a wildcard bind anyone who can reach the port
+	// can spend this account's quota. Local-only clients do not need that exposure.
+	if usingDefaultAuthToken() && isWildcardHost(config.Server.Host) {
+		logConsolef("[Security] a built-in API key is accepted and the proxy is "+
+			"listening on all interfaces, so anyone who can reach port %d can use "+
+			"your Z.AI account. Set your own AUTH_TOKEN in .env, or HOST=127.0.0.1 to "+
+			"accept local clients only.", config.Server.Port)
+	}
+
+	// A guest account cannot upload images or reach vision models, and the client
+	// sees only a bare 401 or 403, so name the cause here.
+	if config.ZaiToken == "" {
+		logConsolef("[Session] ZAI_TOKEN is not set, so this runs as a guest. Guests cannot " +
+			"upload images or use vision models, and those requests fail with 401/403. " +
+			"Set it from the tray icon: right-click and choose Change token.")
 	}
 
 	gRunning.Store(true)
 
-	// One cancel scope for all background workers, so shutdown stops them
-	// rather than leaving them running past srv.Shutdown.
+	// One cancel scope for every background worker, so shutdown actually stops
+	// them instead of leaving them running past srv.Shutdown.
 	bgCtx, stopBackground := context.WithCancel(context.Background())
 	defer stopBackground()
 
@@ -123,19 +148,21 @@ func Run() {
 	handler := NewHandler()
 
 	addr := fmt.Sprintf("%s:%d", config.Server.Host, config.Server.Port)
-	logBanner(startupBanner())
+	logBanner(startupBanner(false), startupBanner(true))
 
+	// Tracked, so a shutdown inside the first few seconds does not close the log and
+	// the database underneath it.
+	background.Add(1)
 	go func() {
+		defer background.Done()
 		if err := initializeSession(); err != nil {
 			logConsolef("[Startup] Session init deferred — will retry on first request.")
 		}
 		fetchModelsFromZAI() // warm the model cache
 	}()
 
-	// Every request runs on a throwaway chat session, deleted on Z.AI once its
-	// response is processed, so the account never accumulates dead sessions.
-	// The async flow keeps a standing batch ready; --sync-mode mints one per
-	// request instead. Either way they are garbage-collected.
+	// See session_pool.go: either mode runs each request on a throwaway chat
+	// that is deleted upstream once its response is processed.
 	if config.SyncMode {
 		logInfof("[Startup] Session mode: SYNC (fresh chat per request, deleted after use)")
 	} else {
@@ -152,38 +179,35 @@ func Run() {
 		Addr:    addr,
 		Handler: handler,
 		// WriteTimeout must stay unset: responses are long-lived SSE streams.
-		// These two bound the parts that should never be slow, closing the
-		// Slowloris exposure of a server with no timeouts at all.
+		// These two bound the parts that should never be slow, which closes the
+		// Slowloris hole a server with no timeouts at all would leave open.
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		ErrorLog:          log.Default(),
 	}
 
-	// Start serving before blocking on signals.
+	// Serve before blocking on signals.
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- srv.ListenAndServe()
 	}()
 
-	// Warm the standing session batch in the background; requests are served
-	// meanwhile (they simply queue on Acquire until sessions appear).
+	// Warm the batch in the background; requests queue on Acquire meanwhile.
 	if sessionPool != nil {
 		sessionPool.Start()
 	}
 
-	// SIGINT/SIGTERM stops accepting connections, lets in-flight responses
-	// finish within the drain deadline, then clears every still-pooled chat
-	// session on Z.AI. A second signal force-exits, since default handling is
-	// re-armed by stopSignal.
+	// SIGINT/SIGTERM stops accepting, drains in-flight responses, then clears
+	// still-pooled sessions. A second signal force-exits, because stopSignal
+	// re-arms default handling.
 	ctx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
 
 	select {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			// Cleanup is explicit rather than deferred: log.Fatal would skip
-			// every defer and abandon the database handle, the log buffer and
-			// the pooled chat sessions.
+			// Explicit, not deferred: log.Fatal would skip every defer and
+			// abandon the DB handle, log buffer and pooled sessions.
 			logErrorf("[Server] %v", err)
 			gRunning.Store(false)
 			stopBackground()
@@ -207,35 +231,33 @@ func Run() {
 		}
 		cancel()
 
-		// The captcha cache waits for in-flight handshakes and the token
-		// monitor kills its collector child, rather than orphaning a browser.
+		// The cache waits for in-flight handshakes and the monitor kills its
+		// collector child, rather than orphaning a browser.
 		stopBackground()
 		background.Wait()
 
-		// Checked-out sessions are deleted by their own Release; these are the
-		// ones still sitting in the pool.
+		// Checked-out sessions go via their own Release; these are the leftovers.
 		if sessionPool != nil {
 			sessionPool.Shutdown()
 		}
+		// Those Releases delete upstream in the background. Exiting without waiting
+		// would leave chats live on the account, which is what the deletes are for.
+		waitForSessionGC(sessionGCDrain)
 		logConsolef("[Shutdown] all chat sessions cleared. Goodbye.")
 		flushLogs()
 	}
 }
 
-// ============================================================================
-// DEVICE TOKEN REPLENISHMENT
-// ============================================================================
-
-// startupBanner renders the boxed summary printed once at startup. Widths are
-// computed rather than hardcoded, so a 4-digit port or a long auth token cannot
-// break the box the way the fixed padding used to.
-func startupBanner() string {
+// startupBanner renders the boxed startup summary. Widths are computed, so a long auth
+// token cannot break the box; redacted masks that token for the log.txt copy.
+func startupBanner(redacted bool) string {
+	authToken := authTokenDisplay(redacted)
 	rows := [][2]string{
 		{"Listening", addrForDisplay()},
 		{"Health", fmt.Sprintf("http://localhost:%d/health", config.Server.Port)},
 		{"OpenAI API", fmt.Sprintf("http://localhost:%d/v1/chat/completions", config.Server.Port)},
 		{"Anthropic API", fmt.Sprintf("http://localhost:%d/v1/messages", config.Server.Port)},
-		{"Auth token", config.Auth.Token},
+		{"Auth token", authToken},
 		{"Agent mode", agentModeLabel()},
 		{"Log level", fmt.Sprintf("%s (console shows one line per request)", config.Logging.Level)},
 		{"Log file", filepath.Join(config.Logging.Dir, "log.txt")},
@@ -248,29 +270,37 @@ func startupBanner() string {
 			labelWidth = n
 		}
 	}
-	inner := len([]rune(title))
+
+	// Lay out every row first, then size the box to the longest. Rows used to be
+	// padded to two widths depending on whether the value held a URL, which left
+	// the link rows short and the box permanently open.
+	lines := make([]string, 0, len(rows)+1)
+	lines = append(lines, title)
 	for _, r := range rows {
-		if n := labelWidth + 2 + len([]rune(r[1])); n > inner {
-			inner = n
+		lines = append(lines, fmt.Sprintf("%-*s  %s", labelWidth, r[0], r[1]))
+	}
+
+	width := 0
+	for _, l := range lines {
+		if n := len([]rune(l)); n > width {
+			width = n
 		}
 	}
-	inner += 4 // two spaces of padding either side
 
-	const linkIconPad = 3
-	outer := inner + linkIconPad
+	// A row is "|  " + text + pad + "|", a border is "+" + dashes + "+".
+	// dashes = width+4 gives two spaces either side and equal total length.
+	dashes := width + 4
 
 	var b strings.Builder
-	line := func() {
-		b.WriteString("+")
-		b.WriteString(strings.Repeat("-", outer))
+	b.Grow((dashes + 4) * (len(lines) + 4))
+
+	border := func() {
+		b.WriteByte('+')
+		b.WriteString(strings.Repeat("-", dashes))
 		b.WriteString("+\n")
 	}
-	row := func(text string, hasLink bool) {
-		target := outer
-		if hasLink {
-			target = inner
-		}
-		pad := target - 2 - len([]rune(text))
+	row := func(text string) {
+		pad := dashes - 2 - len([]rune(text))
 		if pad < 0 {
 			pad = 0
 		}
@@ -281,13 +311,13 @@ func startupBanner() string {
 	}
 
 	b.WriteByte('\n')
-	line()
-	row(title, false)
-	line()
-	for _, r := range rows {
-		row(fmt.Sprintf("%-*s  %s", labelWidth, r[0], r[1]), strings.Contains(r[1], "http"))
+	border()
+	row(lines[0])
+	border()
+	for _, l := range lines[1:] {
+		row(l)
 	}
-	line()
+	border()
 	return b.String()
 }
 
@@ -310,8 +340,8 @@ func agentModeLabel() string {
 	}
 }
 
-// resolveCollectorPath locates the token-collector executable, honouring the
-// platform's extension and falling back to PATH.
+// resolveCollectorPath finds the collector exe, honouring the platform extension
+// and falling back to PATH.
 func resolveCollectorPath() (string, bool) {
 	if p := config.TokenMonitor.CollectorPath; p != "" {
 		if abs, err := filepath.Abs(p); err == nil {
@@ -328,7 +358,7 @@ func resolveCollectorPath() (string, bool) {
 	}
 
 	candidates := []string{name}
-	// Alongside our own executable, so the working directory does not matter.
+	// Beside our own exe, so the working directory does not matter.
 	if self, err := os.Executable(); err == nil {
 		candidates = append(candidates, filepath.Join(filepath.Dir(self), name))
 	}
@@ -347,8 +377,8 @@ func resolveCollectorPath() (string, bool) {
 	return "", false
 }
 
-// tokenMonitor keeps the device token store stocked. Every captcha
-// verification spends one token, so an empty store fails every completion.
+// tokenMonitor keeps the store stocked. Every verification spends one token, so
+// an empty store fails every completion.
 func tokenMonitor(ctx context.Context) {
 	collector, ok := resolveCollectorPath()
 	if !ok {
@@ -360,9 +390,13 @@ func tokenMonitor(ctx context.Context) {
 	logConsolef("[Tokens] monitor active: collector=%s threshold=%d interval=%s",
 		collector, config.TokenMonitor.MinTokens, config.TokenMonitor.Interval)
 
-	// Consecutive failures back the loop off, so a collector that cannot
-	// succeed (expired credentials, no browser, locked database) is not
-	// relaunched at full rate forever.
+	// Requests may now wait on this loop instead of failing, so advertise that it
+	// exists and is working.
+	collectorHealthy.Store(true)
+	defer collectorHealthy.Store(false)
+
+	// Consecutive failures back the loop off, so a collector that cannot succeed
+	// (bad credentials, no browser, locked database) is not relaunched forever.
 	failures := 0
 
 	for {
@@ -376,10 +410,12 @@ func tokenMonitor(ctx context.Context) {
 					return
 				}
 				failures++
+				collectorHealthy.Store(false)
 				metrics.collectorFailures.Add(1)
 				logErrorf("[Tokens] collector failed (%d consecutive): %v", failures, err)
 			} else {
 				failures = 0
+				collectorHealthy.Store(true)
 				metrics.collectorRuns.Add(1)
 				metrics.collectorLastRun.Store(time.Now().Unix())
 				logConsolef("[Tokens] collector finished; %d tokens available", refreshTokenCount())
@@ -396,16 +432,26 @@ func tokenMonitor(ctx context.Context) {
 			logWarnf("[Tokens] backing off for %s after %d failures", wait, failures)
 		}
 
+		// While the collector succeeds, a request that hit an empty store can cut
+		// the wait short. A nil channel blocks forever in select, so once runs
+		// fail the backoff is honoured instead of bypassed by every request.
+		var demand <-chan struct{}
+		if failures == 0 {
+			demand = tokenDemand
+		}
+
 		select {
 		case <-ctx.Done():
 			return
+		case <-demand:
+			logConsolef("[Tokens] a request is waiting on tokens; collecting now")
 		case <-time.After(wait):
 		}
 	}
 }
 
-// collectorRunning keeps two collector processes off the same SQLite file. The
-// monitor loop cannot overlap itself, but a manual run can.
+// collectorRunning keeps two collectors off the same SQLite file: the loop cannot
+// overlap itself, but a manual run can.
 var collectorRunning atomic.Bool
 
 func runTokenCollector(ctx context.Context, collector string) error {
@@ -422,49 +468,104 @@ func runTokenCollector(ctx context.Context, collector string) error {
 		dbAbs = dbPath
 	}
 
-	// No --fresh: the store still holds usable tokens while this runs, and the
-	// collector appends by default.
+	// No --fresh: the store still holds usable tokens, and the collector appends.
 	cmd := exec.CommandContext(runCtx, collector,
 		"--no-tui",
 		"--batch", strconv.Itoa(config.TokenMonitor.Batch),
 		"--db-path", dbAbs,
 	)
 	cmd.Dir = filepath.Dir(collector)
-	// Killed on cancellation rather than left as an orphaned Playwright browser
-	// tree, with a grace period to close the database cleanly first.
+	// Killed on cancellation rather than orphaning a Playwright browser tree,
+	// with a grace period to close the database cleanly.
 	cmd.WaitDelay = 10 * time.Second
 
-	// Captured so a failing collector is not silent.
-	var output strings.Builder
-	cmd.Stdout = &boundedWriter{dst: &output, limit: 8 << 10}
-	cmd.Stderr = cmd.Stdout
+	// Line by line for visible progress, plus a bounded tail for error context.
+	progress := &collectorProgress{limit: 8 << 10}
+	cmd.Stdout = progress
+	cmd.Stderr = progress
 
-	if err := cmd.Run(); err != nil {
-		if tail := strings.TrimSpace(output.String()); tail != "" {
+	err = cmd.Run()
+	progress.close()
+	if err != nil {
+		if tail := progress.tail(); tail != "" {
 			return fmt.Errorf("%w: %s", err, tail)
 		}
 		return err
 	}
-	if debugEnabled() {
-		logDebugf("[Tokens] collector output: %s", strings.TrimSpace(output.String()))
-	}
 	return nil
 }
 
-// boundedWriter keeps at most limit bytes, so a chatty child cannot grow the
-// buffer without bound.
-type boundedWriter struct {
-	dst   *strings.Builder
+// collectorProgress forwards the collector's output line by line, so a first run
+// shows progress in Monitor instead of looking idle while a headless browser
+// works. The bounded tail lets a failure say more than its exit status without
+// letting a chatty child grow the buffer without limit.
+type collectorProgress struct {
+	mu    sync.Mutex
+	line  strings.Builder
+	kept  strings.Builder
 	limit int
 }
 
-func (b *boundedWriter) Write(p []byte) (int, error) {
-	if room := b.limit - b.dst.Len(); room > 0 {
+func (c *collectorProgress) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if room := c.limit - c.kept.Len(); room > 0 {
 		if len(p) > room {
-			b.dst.Write(p[:room])
+			c.kept.Write(p[:room])
 		} else {
-			b.dst.Write(p)
+			c.kept.Write(p)
+		}
+	}
+
+	for _, b := range p {
+		switch b {
+		case '\n':
+			c.emitLocked()
+		case '\r':
+			// The collector redraws with carriage returns, so treat the segment
+			// as complete rather than gluing the next one on.
+			c.emitLocked()
+		default:
+			c.line.WriteByte(b)
 		}
 	}
 	return len(p), nil
+}
+
+func (c *collectorProgress) emitLocked() {
+	text := strings.TrimSpace(c.line.String())
+	c.line.Reset()
+	if informativeLine(text) {
+		logConsolef("[Collector] %s", text)
+	}
+}
+
+// close flushes a trailing line that never got its newline.
+func (c *collectorProgress) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.emitLocked()
+}
+
+func (c *collectorProgress) tail() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return strings.TrimSpace(c.kept.String())
+}
+
+// informativeLine rejects the collector's decorative rules, built from one
+// repeated character and worth no log line.
+func informativeLine(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		switch r {
+		case '=', '-', '_', '~', '*', ' ', '═', '─', '━', '┈':
+		default:
+			return true
+		}
+	}
+	return false
 }

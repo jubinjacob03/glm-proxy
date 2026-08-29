@@ -27,11 +27,11 @@ func TestSetEnvValueReplacesInPlace(t *testing.T) {
 	if strings.Contains(text, "old.jwt.value") {
 		t.Errorf("old token still present:\n%s", text)
 	}
-	// Untouched lines must survive.
+	// Unrelated lines must survive the rewrite.
 	if !strings.Contains(text, "AUTH_TOKEN=Jubin") || !strings.Contains(text, "PORT=3007") {
 		t.Errorf("unrelated lines lost:\n%s", text)
 	}
-	// Exactly one ZAI_TOKEN line.
+	// Rewritten in place, not appended: exactly one ZAI_TOKEN line.
 	if n := strings.Count(text, "ZAI_TOKEN="); n != 1 {
 		t.Errorf("expected 1 ZAI_TOKEN line, got %d:\n%s", n, text)
 	}
@@ -64,11 +64,11 @@ func TestSetEnvValueCreatesFile(t *testing.T) {
 	}
 }
 
-// TestSupervisorLifecycle exercises the real spawn/reap/kill path (the code that
-// previously double-waited) against a short-lived child, with no tray UI.
+// TestSupervisorLifecycle exercises the real spawn/reap/kill path — the code that
+// once double-waited — against a short-lived child, with no tray UI.
 func TestSupervisorLifecycle(t *testing.T) {
 	dir := t.TempDir()
-	// A child that stays alive until killed: ping loops for ~30s.
+	// A child that stays alive until killed: ping loops for about 30s.
 	child := filepath.Join(dir, "zai-api.exe")
 	if err := copyFile(os.Getenv("ComSpec"), child); err != nil {
 		t.Skipf("cannot stage a stub child: %v", err)
@@ -93,7 +93,7 @@ func TestSupervisorLifecycle(t *testing.T) {
 		t.Fatal("no child process recorded after start")
 	}
 
-	// cmd.exe with no args and a redirected stdout exits on its own; either way
+	// cmd.exe with no args and redirected stdout exits by itself; either way
 	// killChild must return and the reaper must close exited exactly once.
 	s.killChild()
 	select {

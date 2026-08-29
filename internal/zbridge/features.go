@@ -19,37 +19,39 @@ func normalizeFeatureKey(k string) string {
 	return sb.String()
 }
 
-// getModelFeatureState returns the per-model state, creating it if necessary.
-func getModelFeatureState(modelID string) *ModelFeatureState {
+// The live *ModelFeatureState never leaves the mutex; see snapshotModelFeatureState.
+
+// copyFeatureStateLocked duplicates a state; the caller must hold the mutex.
+func copyFeatureStateLocked(s *ModelFeatureState) *ModelFeatureState {
+	out := &ModelFeatureState{
+		IncludeAll: s.IncludeAll,
+		Overrides:  make(map[string]interface{}, len(s.Overrides)),
+	}
+	for k, v := range s.Overrides {
+		out.Overrides[k] = v
+	}
+	return out
+}
+
+// snapshotModelFeatureState copies the state for reading outside the lock: aliasing it
+// let a reader range Overrides while POST /features wrote it, a fatal map race. Creates
+// nothing, so a read never registers a model.
+func snapshotModelFeatureState(modelID string) *ModelFeatureState {
 	modelFeatureStatesMu.Lock()
 	defer modelFeatureStatesMu.Unlock()
 	if s, ok := modelFeatureStates[modelID]; ok {
-		return s
+		return copyFeatureStateLocked(s)
 	}
-	s := &ModelFeatureState{
-		IncludeAll: false,
-		Overrides:  make(map[string]interface{}),
-	}
-	modelFeatureStates[modelID] = s
-	return s
+	return &ModelFeatureState{Overrides: make(map[string]interface{})}
 }
 
-// resolveFeaturesForModel computes the final feature map for /completions.
+// resolveFeaturesForModel builds the feature map sent to /completions.
 func resolveFeaturesForModel(modelID string) map[string]interface{} {
 	caps := getModelCapabilities(modelID)
-	modelFeatureStatesMu.Lock()
-	state, ok := modelFeatureStates[modelID]
-	modelFeatureStatesMu.Unlock()
-	if !ok {
-		state = &ModelFeatureState{
-			IncludeAll: false,
-			Overrides:  make(map[string]interface{}),
-		}
-	}
-	return resolveFeaturesWithState(caps, state)
+	return resolveFeaturesWithState(caps, snapshotModelFeatureState(modelID))
 }
 
-// resolveFeaturesWithState resolves caps against per-model state:
+// resolveFeaturesWithState resolves capabilities against per-model state:
 //   - web_search and auto_web_search are off unless requested.
 //   - enable_thinking defaults to true; 'think' never reaches the request.
 //   - stored overrides take precedence over server capabilities.
@@ -59,8 +61,8 @@ func resolveFeaturesWithState(caps map[string]interface{}, state *ModelFeatureSt
 
 	if state.IncludeAll {
 		for k, v := range caps {
-			// In capabilities this is a boolean support flag, not a value;
-			// sendToZAI resolves the real per-request setting.
+			// Here it is a boolean support flag, not a value; sendToZAI resolves
+			// the real per-request setting.
 			if k == "reasoning_effort" {
 				continue
 			}

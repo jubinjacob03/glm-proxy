@@ -1,4 +1,3 @@
-// cmd/token-collector/main.go
 // Standalone binary that seeds tokens.sqlite with device tokens harvested from
 // chat.z.ai using a stealthed headless browser.
 //
@@ -13,6 +12,7 @@
 //	token-collector --tokens 750 --batch 3
 //	token-collector --unsafe               raises the token and batch ceilings
 //	token-collector --headed               visible browser, for debugging
+//	token-collector --install-browsers     setup step: fetch the driver and Chromium
 
 package main
 
@@ -36,6 +36,8 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mxschmitt/playwright-go"
 	_ "modernc.org/sqlite" // pure-Go SQLite, no CGO needed
+
+	"zai-api/internal/ansi"
 )
 
 const (
@@ -50,18 +52,17 @@ const (
 	TokenCollectionTimeoutMs = 90000
 	URL                      = "https://chat.z.ai"
 
-	// The model selector button's id encodes the selected model (e.g.
-	// model-selector-x-preview-l-button, model-selector-glm-4_7-button),
-	// so it is matched by prefix instead of a fixed id.
+	// The button id encodes the selected model (model-selector-glm-4_7-button),
+	// so it is matched by prefix rather than a fixed id.
 	ModelSelectorButton = `button[id^="model-selector-"][id$="-button"]`
 
-	// Workers are parallel pages on a single browser, not parallel browsers.
+	// Workers are pages on one browser, not separate browsers.
 	MaxParallel       = 3
 	UnsafeMaxParallel = 5
 
-	// Keep the stealth identity coherent with itself and with the region of
-	// your egress IP. Proxying through Tokyo means Asia/Tokyo, ja-JP and a
-	// matching Accept-Language.
+	// Keep the identity coherent with itself and with your egress region:
+	// proxying through Tokyo means Asia/Tokyo, ja-JP and a matching
+	// Accept-Language.
 	StealthTimezone = "America/New_York"
 	StealthLocale   = "en-US"
 )
@@ -76,21 +77,167 @@ var (
 	noTUIFlag         = flag.Bool("no-tui", false, "disable TUI, use plain text output")
 	dbPathFlag        = flag.String("db-path", "tokens.sqlite", "path to the SQLite token database")
 	freshFlag         = flag.Bool("fresh", false, "delete the existing database first instead of appending")
+	installFlag       = flag.Bool("install-browsers", false, "download the Playwright driver and Chromium, then exit")
+	stockedFlag       = flag.Int("skip-if-stocked", 0, "exit without collecting if the database already holds at least this many tokens")
+	deadlineFlag      = flag.Int("deadline", 0, "give up after this many seconds (0 = no limit)")
 )
 
-// The default 100% lets the heap double before collecting; 200% lets it grow
-// threefold, which roughly halves GC pauses in this allocation-heavy workload.
+// Remembered so the deadline can tear it down: os.Exit skips the deferred Close.
+var (
+	activeMu      sync.Mutex
+	activePW      *playwright.Playwright
+	activeBrowser playwright.Browser
+)
+
+func rememberBrowser(pw *playwright.Playwright, b playwright.Browser) {
+	activeMu.Lock()
+	activePW, activeBrowser = pw, b
+	activeMu.Unlock()
+}
+
+func closeBrowser() {
+	activeMu.Lock()
+	pw, b := activePW, activeBrowser
+	activeMu.Unlock()
+	if b != nil {
+		_ = b.Close()
+	}
+	if pw != nil {
+		_ = pw.Stop()
+	}
+}
+
+// startDeadline bounds an unattended run. nsExec's /TIMEOUT is a no-op in the
+// shipped plugin, so the child must bound itself or a stall hangs setup.
+func startDeadline(d time.Duration) {
+	go func() {
+		time.Sleep(d)
+		deadlineHit.Store(true)
+		logFail("giving up after %s", d)
+
+		// Close chrome and node, but never wait on it: Close blocks, and the main
+		// flow keeps retrying meanwhile, which ran past the deadline.
+		done := make(chan struct{})
+		go func() {
+			closeBrowser()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(browserCloseGrace):
+		}
+
+		// Checkpoint the WAL, so the next opener does not have to recover it.
+		if ts := activeStore.Load(); ts != nil {
+			ts.close()
+		}
+
+		// Batches already committed are usable, so report success for them: the
+		// caller only cares whether the store came out stocked.
+		if n := storedCount.Load(); n > 0 {
+			logOK("banked %d tokens before the deadline", n)
+			os.Exit(0)
+		}
+		os.Exit(1)
+	}()
+}
+
+const browserCloseGrace = 5 * time.Second
+
+// deadlineHit stops the retry loop failing against a browser the deadline closed.
+var deadlineHit atomic.Bool
+
+// Tracked so the deadline can checkpoint the WAL and report honestly: a run that
+// banked several batches before timing out is a success for the caller.
+var (
+	activeStore atomic.Pointer[tokenStore]
+	storedCount atomic.Int64
+)
+
+// Playwright caches sit under LOCALAPPDATA\GLM-Proxy, not the library's own user
+// cache, so setup can fill them and the uninstaller can keep or wipe them as one.
+const appDataDirName = "GLM-Proxy"
+
+// UserCacheDir is LOCALAPPDATA on Windows, which is the path the installer hard
+// codes, and the right per-platform cache elsewhere.
+func appDataDir() string {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base = "."
+	}
+	return filepath.Join(base, appDataDirName)
+}
+
+// playwrightOptions pins the driver dir; browsers come from PLAYWRIGHT_BROWSERS_PATH.
+func playwrightOptions() *playwright.RunOptions {
+	opts := &playwright.RunOptions{Browsers: []string{"chromium"}}
+	if os.Getenv("PLAYWRIGHT_DRIVER_PATH") == "" {
+		opts.DriverDirectory = filepath.Join(appDataDir(), "playwright-driver")
+	}
+	return opts
+}
+
+func pinBrowserCache() {
+	if os.Getenv("PLAYWRIGHT_BROWSERS_PATH") == "" {
+		_ = os.Setenv("PLAYWRIGHT_BROWSERS_PATH", filepath.Join(appDataDir(), "browsers"))
+	}
+}
+
+// installBrowsers is the setup step, so a first launch has nothing left to fetch.
+func installBrowsers() error {
+	logStep("browser", "downloading the Playwright driver and Chromium build")
+	if err := playwright.Install(playwrightOptions()); err != nil {
+		return err
+	}
+	logOK("browser components ready in %s", appDataDir())
+	return nil
+}
+
+// resolveDBPath makes the flag absolute and ensures its directory exists.
+func resolveDBPath() (string, error) {
+	p := *dbPathFlag
+	if p == "" {
+		p = "tokens.sqlite"
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if dir := filepath.Dir(p); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", fmt.Errorf("create db directory: %w", err)
+		}
+	}
+	return p, nil
+}
+
+// storedTokenCount reports what the store holds; unreadable counts as zero.
+func storedTokenCount(dbPath string) int {
+	if _, err := os.Stat(dbPath); err != nil {
+		return 0
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbPath)+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		return 0
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM tokens`).Scan(&n); err != nil {
+		return 0
+	}
+	return n
+}
+
+// The default 100% lets the heap double before collecting; 200% lets it triple,
+// roughly halving GC pauses in this allocation-heavy workload.
 func init() {
 	debug.SetGCPercent(200)
 }
 
-// ============================================================================
-// TUI
-// ============================================================================
+// Live progress TUI, used unless --no-tui is set.
 
 var spinnerChars = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-// logCapture stores log lines in a ring buffer for the TUI to display.
+// logCapture is a ring buffer of recent lines for the TUI to render.
 type logCapture struct {
 	mu     sync.Mutex
 	lines  []string
@@ -114,7 +261,7 @@ func (lc *logCapture) Lines() []string {
 	return out
 }
 
-// Atomics, so the TUI goroutine reads without locking.
+// Atomics, so the TUI goroutine reads these without locking.
 var (
 	tuiLogCapture      = &logCapture{maxLen: 1000}
 	tuiStatus          atomic.Value // string
@@ -194,7 +341,7 @@ func (m tuiModel) View() string {
 		return "Terminal too small (min 40x10). Resize or press q to quit."
 	}
 
-	// Color styles
+	// Palette.
 	stTitle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
 	stLabel := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	stAcc := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
@@ -202,7 +349,7 @@ func (m tuiModel) View() string {
 	stDim := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	stBar := lipgloss.NewStyle().Foreground(lipgloss.Color("99"))
 
-	// Gather state from atomics (lock-free)
+	// Read the atomics once, lock-free.
 	status := "Initializing..."
 	if v := tuiStatus.Load(); v != nil {
 		status = v.(string)
@@ -219,7 +366,7 @@ func (m tuiModel) View() string {
 	}
 	elapsed := time.Since(st).Round(time.Second)
 
-	// Header / status block
+	// Header and status.
 	var hdr strings.Builder
 	hdr.WriteString(stTitle.Render("🔑 Token Collector"))
 	hdr.WriteByte('\n')
@@ -236,7 +383,7 @@ func (m tuiModel) View() string {
 	}
 	hdr.WriteByte('\n')
 
-	// Progress bar
+	// Progress bar.
 	if tb > 0 {
 		pct := float64(bd) / float64(tb)
 		bw := 20
@@ -251,7 +398,7 @@ func (m tuiModel) View() string {
 			stAcc.Render(fmt.Sprintf("%d/%d (%.0f%%)", bd, tb, pct*100))))
 	}
 
-	// Stats line
+	// Counters and rate.
 	target := tb * tpb
 	stats := fmt.Sprintf("%s %s / %s",
 		stLabel.Render("Tokens:"),
@@ -267,7 +414,7 @@ func (m tuiModel) View() string {
 	headerStr := hdr.String()
 	headerLines := strings.Count(headerStr, "\n")
 
-	// Log pane
+	// Captured log tail.
 	logH := m.height - headerLines - 4 // -4: sep + log header + sep + footer
 	if logH < 2 {
 		logH = 2
@@ -296,7 +443,7 @@ func (m tuiModel) View() string {
 	}
 	logStr := strings.Join(logLines, "\n")
 
-	// Separator and footer
+	// Footer.
 	sep := stDim.Render(strings.Repeat("─", m.width))
 	footer := stDim.Render(" ↑/↓ scroll  •  q quit")
 
@@ -304,6 +451,34 @@ func (m tuiModel) View() string {
 }
 
 func sleep(ms int) { time.Sleep(time.Duration(ms) * time.Millisecond) }
+
+// A coloured label in a fixed column, then the detail, so a run reads as two
+// columns. The proxy adds "[Collector]" when forwarding, hence no prefix here.
+const labelWidth = 8
+
+func label(paint func(string) string, text string) string {
+	return paint(fmt.Sprintf("%-*s", labelWidth, text))
+}
+
+func logStep(name, format string, args ...interface{}) {
+	fmt.Printf("%s %s\n", label(ansi.Cyan, name), fmt.Sprintf(format, args...))
+}
+
+func logOK(format string, args ...interface{}) {
+	fmt.Printf("%s %s\n", label(ansi.Green, "ok"), fmt.Sprintf(format, args...))
+}
+
+func logWarn(format string, args ...interface{}) {
+	fmt.Printf("%s %s\n", label(ansi.Yellow, "warn"), fmt.Sprintf(format, args...))
+}
+
+func logDone(format string, args ...interface{}) {
+	fmt.Printf("%s %s\n", label(ansi.Violet, "done"), fmt.Sprintf(format, args...))
+}
+
+func logFail(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "%s %s\n", label(ansi.Red, "fail"), fmt.Sprintf(format, args...))
+}
 
 func promptInt(reader *bufio.Reader, prompt string, def, max int) int {
 	fmt.Print(prompt)
@@ -317,11 +492,11 @@ func promptInt(reader *bufio.Reader, prompt string, def, max int) int {
 	}
 	n, err := strconv.Atoi(line)
 	if err != nil || n <= 0 {
-		fmt.Printf("⚠️  Invalid input, using default %d.\n", def)
+		logWarn("invalid input, using default %d", def)
 		return def
 	}
 	if n > max {
-		fmt.Printf("⚠️  Capping to max %d.\n", max)
+		logWarn("capping to max %d", max)
 		return max
 	}
 	return n
@@ -340,8 +515,8 @@ func promptBool(reader *bufio.Reader, prompt string, def bool) bool {
 	return line == "y" || line == "yes"
 }
 
-// tokenStore keeps one tuned SQLite connection open for the whole run.
-// Reopening per batch would force a full fsync and a schema reparse each time.
+// tokenStore keeps one tuned SQLite connection open for the whole run; reopening
+// per batch would force a full fsync and schema reparse each time.
 type tokenStore struct {
 	db          *sql.DB
 	stmt        *sql.Stmt
@@ -363,13 +538,13 @@ func openTokenStore(dbPath string) (*tokenStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	// SQLite serialises writes internally — one connection avoids
-	// "database is locked" errors and avoids pool overhead.
+	// SQLite serialises writes anyway, so one connection avoids both "database is
+	// locked" and pool overhead.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
-	// Force the connection open so PRAGMAs take effect immediately.
+	// Force it open now, so the PRAGMAs actually take effect.
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, err
@@ -383,7 +558,7 @@ func openTokenStore(dbPath string) (*tokenStore, error) {
 		db.Close()
 		return nil, err
 	}
-	// Index for fast batch lookups
+	// Indexed so batch lookups stay cheap as the store grows.
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_tokens_batch ON tokens(batch)`); err != nil {
 		db.Close()
 		return nil, err
@@ -395,8 +570,8 @@ func openTokenStore(dbPath string) (*tokenStore, error) {
 		return nil, err
 	}
 
-	// Continue numbering past whatever is already stored, so the batch column
-	// stays meaningful when appending to an existing database.
+	// Continue past whatever is stored, so the batch column stays meaningful when
+	// appending to an existing database.
 	var maxBatch int
 	_ = db.QueryRow(`SELECT COALESCE(MAX(batch), 0) FROM tokens`).Scan(&maxBatch)
 
@@ -411,10 +586,10 @@ func (ts *tokenStore) merge(batchNum int, tokens []string) error {
 	if err != nil {
 		return err
 	}
-	// Rollback is a no-op after Commit, so this is safe.
+	// Rollback is a no-op after Commit, so deferring it is safe.
 	defer tx.Rollback()
 
-	// Bind the prepared statement to this transaction.
+	// Bind the prepared insert to this transaction.
 	txStmt := tx.Stmt(ts.stmt)
 	defer txStmt.Close()
 
@@ -431,14 +606,12 @@ func (ts *tokenStore) close() {
 	ts.db.Close()
 }
 
-// =====================================================================
-// STEALTH LAYER — make headless Chromium indistinguishable from a real
-// interactive Chrome running on a desktop.
-// =====================================================================
+// Stealth layer: make headless Chromium indistinguishable from a real
+// interactive Chrome on a desktop.
 
-// stealthChromeMajor resolves the bundled Chromium's major version once
-// so the spoofed UA / userAgentData match the REAL engine version
-// (a Chrome/131 UA on a Chromium/140 engine is itself a mismatch flag).
+// stealthChromeMajor resolves the bundled Chromium's major version once, so the
+// spoofed UA and userAgentData match the real engine: a Chrome/131 UA on a
+// Chromium/140 engine is itself a mismatch flag.
 var (
 	stealthVersionOnce sync.Once
 	stealthMajor       string
@@ -453,21 +626,19 @@ func stealthChromeMajor(browser playwright.Browser) string {
 		if stealthMajor == "" {
 			stealthMajor = "131"
 		}
-		fmt.Printf("🥷 Stealth identity: Chrome/%s on Windows 10 (x64)\n", stealthMajor)
+		logStep("stealth", "identity Chrome/%s on Windows 10 (x64)", stealthMajor)
 	})
 	return stealthMajor
 }
 
 func stealthUserAgent(major string) string {
-	// Identical to a real headed Chrome on Windows 10 — no "HeadlessChrome".
+	// Identical to headed Chrome on Windows 10: no "HeadlessChrome" token.
 	return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + major + ".0.0.0 Safari/537.36"
 }
 
-// stealthJSTemplate is injected via AddInitScript — it runs BEFORE any page
-// script (including captcha SDKs) on every document and every frame.
-// __VER__ is replaced with the real Chromium major version at runtime.
-//
-// Coverage:
+// stealthJSTemplate is injected via AddInitScript, so it runs before any page
+// script (captcha SDKs included) on every document and frame. __VER__ becomes the
+// real Chromium major version at runtime. What it patches:
 //  1. navigator.webdriver        → false (prototype-level)
 //  2. languages / language       → en-US
 //  3. platform                   → Win32 (coherent with the UA)
@@ -792,10 +963,8 @@ const stealthJSTemplate = `(function () {
     } catch (e) {}
 })();`
 
-// =====================================================================
-// HUMAN INPUT SYNTHESIS — anti-bot systems watch pointer trajectories,
-// dwell times, and typing cadence. Synthesize them.
-// =====================================================================
+// Human input synthesis: anti-bot systems watch pointer trajectories, dwell
+// times and typing cadence, so all three are synthesised.
 
 var humanRand = rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -807,8 +976,8 @@ func humanPause(msMin, msMax int) {
 	time.Sleep(time.Duration(jitter(float64(msMin), float64(msMax))) * time.Millisecond)
 }
 
-// humanMouseTo sweeps the cursor from a random point toward (tx,ty) with
-// smoothstep easing and per-step jitter — mimics a human pointer path.
+// humanMouseTo sweeps from a random point toward (tx,ty) with smoothstep easing
+// and per-step jitter, mimicking a human pointer path.
 func humanMouseTo(page playwright.Page, tx, ty float64) error {
 	x := jitter(300, 1500)
 	y := jitter(200, 800)
@@ -823,12 +992,12 @@ func humanMouseTo(page playwright.Page, tx, ty float64) error {
 		}
 		time.Sleep(time.Duration(jitter(8, 22)) * time.Millisecond)
 	}
-	// Final exact landing on the target.
+	// Land exactly on the target.
 	return page.Mouse().Move(tx, ty)
 }
 
-// humanClick moves the cursor along an eased path to a random point inside
-// the element, dwells briefly (decision time), then presses and releases.
+// humanClick eases the cursor to a random point inside the element, dwells
+// briefly as a human would, then presses and releases.
 func humanClick(page playwright.Page, loc playwright.Locator) error {
 	box, err := loc.BoundingBox()
 	if err != nil {
@@ -897,9 +1066,9 @@ func selectWorkingModel(page playwright.Page) error {
 	return nil
 }
 
-// collectTokensOnPage harvests up to total device tokens from one page. The page
-// is reused across batches, with route handlers installed once in newWorkerPage,
-// so each call force-reloads by re-navigating.
+// collectTokensOnPage harvests up to total tokens from one page. The page is
+// reused across batches (route handlers live in newWorkerPage), so each call
+// force-reloads by re-navigating.
 func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 	if _, err := page.Goto(URL, playwright.PageGotoOptions{
 		WaitUntil: playwright.WaitUntilStateDomcontentloaded,
@@ -908,7 +1077,7 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 		return nil, fmt.Errorf("goto: %w", err)
 	}
 
-	// Wait for both elements concurrently
+	// Both elements at once, rather than one round trip each.
 	tuiSetStatus("Locating UI elements...")
 	fmt.Println("  Locating UI elements in parallel...")
 	var (
@@ -936,20 +1105,20 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 	if err2 != nil {
 		return nil, fmt.Errorf("textarea not found: %w", err2)
 	}
-	fmt.Println("✅ Model button & textarea found")
+	logOK("model button and textarea found")
 	if err := selectWorkingModel(page); err != nil {
-		fmt.Printf("⚠️  model switch skipped: %v — using the default model\n", err)
+		logWarn("model switch skipped (%v), using the default model", err)
 		_ = page.Keyboard().Press("Escape")
 		humanPause(150, 400)
 	} else {
-		fmt.Println("✅ Model ready")
+		logOK("model ready")
 	}
 
 	textarea := page.Locator("#chat-input")
 
-	// Behavioral warm-up: nobody lands on a page and instantly acts
+	// Warm-up, because nobody lands on a page and acts instantly.
 	tuiSetStatus("Simulating human interaction...")
-	fmt.Println("🧍 Human warm-up: cursor drift + micro-scroll...")
+	logStep("human", "warm-up: cursor drift + micro-scroll")
 	_ = humanMouseTo(page, jitter(500, 1300), jitter(250, 650))
 	humanPause(300, 800)
 	_ = page.Mouse().Wheel(0, jitter(120, 320))
@@ -957,8 +1126,7 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 	_ = page.Mouse().Wheel(0, -jitter(60, 180))
 	humanPause(250, 600)
 
-	// Click into the textarea like a person, then type character by
-	// character with irregular inter-key delays.
+	// Click in like a person, then type with irregular inter-key delays.
 	if err := humanClick(page, textarea); err != nil {
 		return nil, fmt.Errorf("human click on textarea: %w", err)
 	}
@@ -969,7 +1137,7 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 		}
 		humanPause(50, 140)
 	}
-	fmt.Println(`✅ Typed "__" with human-like cadence`)
+	logOK(`typed "__" with human-like cadence`)
 
 	sendBtn := page.Locator("#send-message-button")
 	if err := sendBtn.WaitFor(
@@ -981,13 +1149,13 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 	if err := humanClick(page, sendBtn); err != nil {
 		return nil, fmt.Errorf("human click on send: %w", err)
 	}
-	fmt.Println("✅ Send clicked (eased mouse path + button dwell)")
+	logOK("send clicked (eased mouse path + button dwell)")
 
-	fmt.Printf("⏳ Waiting %dms for token endpoint to initialize...\n", SendWaitMs)
+	logStep("wait", "%dms for the token endpoint to initialise", SendWaitMs)
 	sleep(SendWaitMs)
 
 	tuiSetStatus(fmt.Sprintf("Collecting %d tokens...", total))
-	fmt.Println("🚀 Collecting tokens...")
+	logStep("collect", "requesting %d tokens", total)
 	t0 := time.Now()
 
 	type evalResult struct {
@@ -1021,7 +1189,7 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 		if !ok {
 			return nil, fmt.Errorf("unexpected evaluate result type: %T", res.val)
 		}
-		// Pre-allocate with exact capacity — avoids slice growth reallocations.
+		// Exact capacity, so the append loop never reallocates.
 		tokens := make([]string, 0, len(arr))
 		for _, v := range arr {
 			if s, ok := v.(string); ok {
@@ -1031,18 +1199,17 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 			}
 		}
 		elapsed := time.Since(t0).Seconds()
-		fmt.Printf("✅ Collected %d tokens in %.2fs\n", len(tokens), elapsed)
+		logOK("collected %d tokens in %.2fs", len(tokens), elapsed)
 		return tokens, nil
 
 	case <-time.After(TokenCollectionTimeoutMs * time.Millisecond):
-		return nil, fmt.Errorf("⏱️ token collection timed out after %ds", TokenCollectionTimeoutMs/1000)
+		return nil, fmt.Errorf("token collection timed out after %ds", TokenCollectionTimeoutMs/1000)
 	}
 }
 
 // newWorkerPage builds a worker with its own BrowserContext carrying a coherent
-// fingerprint (UA, locale, timezone, viewport, screen) plus the stealth script
-// injected into every frame before any page JavaScript runs. The optional route
-// allowlist is installed once here rather than per batch.
+// fingerprint (UA, locale, timezone, viewport, screen) plus the stealth script in
+// every frame. The optional route allowlist is installed here, not per batch.
 func newWorkerPage(browser playwright.Browser) (playwright.BrowserContext, playwright.Page, error) {
 	major := stealthChromeMajor(browser)
 	ua := stealthUserAgent(major)
@@ -1068,8 +1235,7 @@ func newWorkerPage(browser playwright.Browser) (playwright.BrowserContext, playw
 		return nil, nil, err
 	}
 
-	// Stealth init script — runs before any page JS on every frame,
-	// including captcha iframes.
+	// Runs before any page JS on every frame, captcha iframes included.
 	if err := page.AddInitScript(playwright.Script{Content: playwright.String(stealthJS)}); err != nil {
 		_ = ctx.Close()
 		return nil, nil, fmt.Errorf("stealth init script: %w", err)
@@ -1090,24 +1256,27 @@ func newWorkerPage(browser playwright.Browser) (playwright.BrowserContext, playw
 	return ctx, page, nil
 }
 
-// runBatch collects one batch, retrying up to MaxRetries. The page is reused
-// across batches and reloaded on every attempt.
+// runBatch collects one batch, retrying up to MaxRetries and reloading the reused
+// page on every attempt.
 func runBatch(page playwright.Page, total, batchNum int) ([]string, error) {
 	var lastErr error
 	for attempt := 1; attempt <= MaxRetries; attempt++ {
+		if deadlineHit.Load() {
+			return nil, fmt.Errorf("batch %d abandoned: deadline reached", batchNum)
+		}
 		tuiSetStatus(fmt.Sprintf("Batch %d — attempt %d/%d", batchNum, attempt, MaxRetries))
-		fmt.Printf("\n🔄 [Batch %d] Attempt %d of %d\n", batchNum, attempt, MaxRetries)
+		logStep(fmt.Sprintf("batch %d", batchNum), "attempt %d of %d", attempt, MaxRetries)
 
 		tokens, err := collectTokensOnPage(page, total)
 
 		if err != nil {
 			lastErr = err
-			fmt.Printf("❌ Attempt %d failed: %v\n", attempt, err)
+			logFail("attempt %d: %v", attempt, err)
 			if attempt == MaxRetries {
-				fmt.Fprintln(os.Stderr, "🚫 All retries exhausted.")
+				logFail("all %d retries exhausted", MaxRetries)
 				break
 			}
-			fmt.Println("♻️  Retrying with a forced page reload...")
+			logStep("retry", "forcing a page reload")
 			continue
 		}
 		return tokens, nil
@@ -1115,7 +1284,7 @@ func runBatch(page playwright.Page, total, batchNum int) ([]string, error) {
 	return nil, fmt.Errorf("batch %d failed: %w", batchNum, lastErr)
 }
 
-// runParallel spreads the batches across N pages on a single browser.
+// runParallel spreads batches across N pages on one browser.
 func runParallel(browser playwright.Browser, tokenCount, batchCount, workers int, ts *tokenStore, dbPath string) (int, error) {
 	var (
 		aborted  atomic.Bool
@@ -1135,9 +1304,9 @@ func runParallel(browser playwright.Browser, tokenCount, batchCount, workers int
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			// Each worker keeps ONE stealth context + page open for all its
-			// batches; every batch force-reloads the page instead of opening
-			// a new one. Closing the context tears down the page with it.
+			// One stealth context and page per worker for all its batches, each
+			// force-reloading rather than opening a new one. Closing the context
+			// tears the page down with it.
 			ctx, page, perr := newWorkerPage(browser)
 			if perr != nil {
 				once.Do(func() {
@@ -1148,12 +1317,13 @@ func runParallel(browser playwright.Browser, tokenCount, batchCount, workers int
 			}
 			defer ctx.Close()
 			for batchNum := range batchCh {
-				// Lock-free check — no mutex contention.
+				// Atomic read, so workers never contend on a mutex here.
 				if aborted.Load() {
 					return
 				}
 
-				fmt.Printf("\n👷 [Worker %d] starting batch %d\n", workerID, batchNum)
+				fmt.Println()
+				logStep(fmt.Sprintf("worker %d", workerID), "starting batch %d", batchNum)
 
 				tokens, err := runBatch(page, tokenCount, batchNum)
 				if err != nil {
@@ -1173,12 +1343,13 @@ func runParallel(browser playwright.Browser, tokenCount, batchCount, workers int
 					return
 				}
 
-				// Lock-free atomic add — no mutex.
+				// Atomic add, same reason.
 				cur := totalCol.Add(int64(len(tokens)))
+				storedCount.Add(int64(len(tokens)))
 
 				tuiBatchesDone.Add(1)
 				tuiTokensCollected.Add(int64(len(tokens)))
-				fmt.Printf("✅ [Worker %d] batch %d done — %d tokens (running total: %d)\n",
+				logOK("worker %d batch %d: %d tokens (running total %d)",
 					workerID, batchNum, len(tokens), cur)
 			}
 		}(w)
@@ -1189,6 +1360,7 @@ func runParallel(browser playwright.Browser, tokenCount, batchCount, workers int
 
 // chromiumPerfArgs disables background throttling, unneeded services and
 // automation detection, keeping the renderer hot and avoiding IPC storms.
+
 var chromiumPerfArgs = []string{
 	"--disable-blink-features=AutomationControlled",
 	"--disable-background-timer-throttling",
@@ -1216,18 +1388,17 @@ var chromiumPerfArgs = []string{
 	"--lang=en-US",
 }
 
-// launchBrowser tells Playwright the browser is headed, then passes
-// --headless=new itself. That runs the new headless engine — real Blink, real
-// GPU pipeline, real fingerprint surface, just no window — so it works on a bare
-// server with no display while the init script patches the remaining headless
-// tells (outerWidth=0, SwiftShader, missing chrome object, HeadlessChrome UA
-// brand). --enable-automation is stripped from Playwright's defaults so the
-// automation flag never reaches the engine.
+// launchBrowser claims the browser is headed, then passes --headless=new itself.
+// That runs the new headless engine — real Blink, real GPU pipeline, real
+// fingerprint surface, just no window — so it works on a display-less server
+// while the init script patches the remaining tells (outerWidth=0, SwiftShader,
+// missing chrome object, HeadlessChrome brand). --enable-automation is stripped
+// from Playwright's defaults so the flag never reaches the engine.
 func launchBrowser(pw *playwright.Playwright, headed bool) (playwright.Browser, error) {
 	base := append([]string{}, chromiumPerfArgs...)
 
 	if headed {
-		// Real visible window for debugging — stealth script still applies.
+		// A real window for debugging; the stealth script still applies.
 		return pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
 			Headless:          playwright.Bool(false),
 			Args:              base,
@@ -1245,9 +1416,9 @@ func launchBrowser(pw *playwright.Playwright, headed bool) (playwright.Browser, 
 		return b, nil
 	}
 
-	// Fallback for ancient Chromium builds that reject --headless=new:
-	// classic headless — the stealth script still patches the surface.
-	fmt.Fprintf(os.Stderr, "⚠️  --headless=new launch failed (%v); falling back to classic headless\n", err)
+	// Old Chromium builds reject --headless=new; classic headless still gets the
+	// stealth script.
+	logWarn("--headless=new launch failed (%v), falling back to classic headless", err)
 	return pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
 		Headless:          playwright.Bool(true),
 		Args:              base,
@@ -1255,8 +1426,8 @@ func launchBrowser(pw *playwright.Playwright, headed bool) (playwright.Browser, 
 	})
 }
 
-// Network allowlist. Only the wildcard rules need a regex; prefix and exact
-// rules are matched with strings.HasPrefix and ==.
+// Network allowlist. Only wildcard rules need a regex; the rest use HasPrefix
+// or ==.
 var (
 	// https://z-cdn.chatglm.cn/z-ai/frontend/prod-fe-*/assets/index-*.js
 	reZCDN = regexp.MustCompile(`^https://z-cdn\.chatglm\.cn/z-ai/frontend/prod-fe-[^/]+/assets/index-[^/]+\.js$`)
@@ -1266,26 +1437,24 @@ var (
 	reFeiLin = regexp.MustCompile(`^https://g\.alicdn\.com/captcha-frontend/FeiLin/[^/]+/feilin[^/]*\.[^/]*\.js$`)
 )
 
-// urlAllowed checks a URL against the allowlist.
-// Fast path: prefix checks via strings.HasPrefix (~5 ns each).
-// Slow path: regex only for wildcard patterns (3 of 5 rules).
-// Switch short-circuits on first match — most requests are decided
-// in O(prefix_length) without ever touching the regex engine.
+// urlAllowed checks a URL against the allowlist. Prefix checks come first (~5 ns)
+// and regex only covers the wildcard rules, so the short-circuiting switch means
+// most requests never reach the regex engine.
 func urlAllowed(u string) bool {
 	switch {
-	// 1. Entire chat.z.ai domain — also allow wss:// for WebSocket upgrades
+	// 1. The whole chat.z.ai domain, wss:// included for WebSocket upgrades.
 	case strings.HasPrefix(u, "https://chat.z.ai/"), strings.HasPrefix(u, "wss://chat.z.ai/"):
 		return true
-	// 2. z-cdn build assets (prefix filter → regex confirm)
+	// 2. z-cdn build assets: prefix filter, then regex confirm.
 	case strings.HasPrefix(u, "https://z-cdn.chatglm.cn/z-ai/frontend/prod-fe-"):
 		return reZCDN.MatchString(u)
-	// 3. Exact Aliyun captcha script (string equality, no regex)
+	// 3. The exact Aliyun captcha script: string equality, no regex.
 	case u == "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js":
 		return true
-	// 4. cloudauth-device-dualstack.*aliyuncs.com (prefix filter → regex confirm)
+	// 4. cloudauth-device-dualstack.*aliyuncs.com: prefix, then regex confirm.
 	case strings.HasPrefix(u, "https://cloudauth-device-dualstack."):
 		return reCloudAuth.MatchString(u)
-	// 5. FeiLin captcha assets (prefix filter → regex confirm)
+	// 5. FeiLin captcha assets: prefix, then regex confirm.
 	case strings.HasPrefix(u, "https://g.alicdn.com/captcha-frontend/FeiLin/"):
 		return reFeiLin.MatchString(u)
 	}
@@ -1293,22 +1462,22 @@ func urlAllowed(u string) bool {
 }
 
 func run(tokenCount, batchCount, parallelWorkers int, headed bool) error {
-	// Install Playwright browsers (best-effort)
-	tuiSetStatus("Installing Playwright...")
-	fmt.Println("⏳ Ensuring Playwright Chromium browser is installed...")
-	if err := playwright.Install(&playwright.RunOptions{
-		Browsers: []string{"chromium"},
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "⚠️  playwright install: %v (continuing anyway)\n", err)
-	}
-
 	tuiSetStatus("Launching browser...")
 	if !headed {
-		fmt.Println("🥷 Stealth mode: new-headless engine + real-Chrome fingerprint emulation + human input synthesis")
+		logStep("stealth", "new-headless engine + real-Chrome fingerprint + human input synthesis")
 	}
-	pw, err := playwright.Run()
+
+	// Setup downloaded these; installing here only heals a cache lost afterwards.
+	pw, err := playwright.Run(playwrightOptions())
 	if err != nil {
-		return fmt.Errorf("playwright run: %w", err)
+		logWarn("browser cache unavailable (%v), downloading it now", err)
+		tuiSetStatus("Downloading browser...")
+		if err := installBrowsers(); err != nil {
+			return fmt.Errorf("playwright install: %w", err)
+		}
+		if pw, err = playwright.Run(playwrightOptions()); err != nil {
+			return fmt.Errorf("playwright run: %w", err)
+		}
 	}
 	defer pw.Stop()
 
@@ -1317,21 +1486,13 @@ func run(tokenCount, batchCount, parallelWorkers int, headed bool) error {
 		return fmt.Errorf("browser launch: %w", err)
 	}
 	defer browser.Close()
+	rememberBrowser(pw, browser)
 
-	// Appending by default matters for unattended replenishment: the proxy's
-	// token monitor invokes this while the store still holds usable tokens, and
-	// wiping would destroy them. --fresh restores the old reset behaviour.
-	dbPath := *dbPathFlag
-	if dbPath == "" {
-		dbPath = "tokens.sqlite"
-	}
-	if abs, err := filepath.Abs(dbPath); err == nil {
-		dbPath = abs
-	}
-	if dir := filepath.Dir(dbPath); dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("create db directory: %w", err)
-		}
+	// Appending by default matters for unattended replenishment: the monitor runs
+	// this while the store still holds usable tokens. --fresh resets instead.
+	dbPath, err := resolveDBPath()
+	if err != nil {
+		return err
 	}
 	if *freshFlag {
 		_ = os.Remove(dbPath)
@@ -1339,36 +1500,35 @@ func run(tokenCount, batchCount, parallelWorkers int, headed bool) error {
 		_ = os.Remove(dbPath + "-shm")
 	}
 
-	// Open DB once and keep it — avoids per-batch open/close/fsync.
+	// Opened once and kept, avoiding a per-batch open/close/fsync.
 	ts, err := openTokenStore(dbPath)
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
 	defer ts.close()
+	activeStore.Store(ts)
 
 	if parallelWorkers > 1 && batchCount > 1 {
 		tuiSetStatus(fmt.Sprintf("Parallel: %d workers", parallelWorkers))
-		fmt.Printf("\n🚀 PARALLEL mode: %d worker page(s) on a single browser\n", parallelWorkers)
+		logStep("parallel", "%d worker page(s) on a single browser", parallelWorkers)
 		totalCollected, err := runParallel(browser, tokenCount, batchCount, parallelWorkers, ts, dbPath)
 		if err != nil {
 			return err
 		}
 
-		fmt.Printf("\n══════════════════════════════════════════\n")
-		fmt.Printf("  ✅ ALL BATCHES COMPLETE (parallel: %d workers)\n", parallelWorkers)
-		fmt.Printf("  📦 %d batches × %d tokens = %d total collected\n",
-			batchCount, tokenCount, totalCollected)
+		fmt.Println()
+		logDone("%d batches x %d tokens = %d tokens collected (%d workers)",
+			batchCount, tokenCount, totalCollected, parallelWorkers)
 		if info, err := os.Stat(dbPath); err == nil {
-			fmt.Printf("  💾 %s (%.1f KB)\n", dbPath, float64(info.Size())/1024.0)
+			logDone("%s (%.1f KB)", dbPath, float64(info.Size())/1024.0)
 		}
-		fmt.Printf("══════════════════════════════════════════\n")
 
 		return nil
 	}
 
 	tuiSetStatus("Starting sequential batches...")
-	// Keep ONE stealth context + page open across all batches; each batch
-	// force-reloads the page instead of opening a new one.
+	// One stealth context and page for all batches; each batch force-reloads
+	// rather than opening a new one.
 	ctx, page, err := newWorkerPage(browser)
 	if err != nil {
 		return fmt.Errorf("page create: %w", err)
@@ -1377,9 +1537,8 @@ func run(tokenCount, batchCount, parallelWorkers int, headed bool) error {
 
 	totalCollected := 0
 	for b := 1; b <= batchCount; b++ {
-		fmt.Printf("\n══════════════════════════════════════════\n")
-		fmt.Printf("  BATCH %d of %d\n", b, batchCount)
-		fmt.Printf("══════════════════════════════════════════\n")
+		fmt.Println()
+		logStep(fmt.Sprintf("batch %d", b), "of %d", batchCount)
 
 		tokens, err := runBatch(page, tokenCount, b)
 		if err != nil {
@@ -1389,38 +1548,66 @@ func run(tokenCount, batchCount, parallelWorkers int, headed bool) error {
 		if err := ts.merge(b, tokens); err != nil {
 			return fmt.Errorf("database merge: %w", err)
 		}
+		storedCount.Add(int64(len(tokens)))
 
 		totalCollected += len(tokens)
 		tuiBatchesDone.Add(1)
 		tuiTokensCollected.Store(int64(totalCollected))
 
 		if info, err := os.Stat(dbPath); err == nil {
-			fmt.Printf("💾 Database: %s (%.1f KB) — %d tokens total across %d batch(es)\n",
+			logStep("db", "%s (%.1f KB), %d tokens across %d batch(es)",
 				dbPath, float64(info.Size())/1024.0, totalCollected, b)
 		}
 	}
 
-	fmt.Printf("\n══════════════════════════════════════════\n")
-	fmt.Printf("  ✅ ALL BATCHES COMPLETE\n")
-	fmt.Printf("  📦 %d batches × %d tokens = %d total collected\n", batchCount, tokenCount, totalCollected)
+	fmt.Println()
+	logDone("%d batches x %d tokens = %d tokens collected", batchCount, tokenCount, totalCollected)
 	if info, err := os.Stat(dbPath); err == nil {
-		fmt.Printf("  💾 %s (%.1f KB)\n", dbPath, float64(info.Size())/1024.0)
+		logDone("%s (%.1f KB)", dbPath, float64(info.Size())/1024.0)
 	}
-	fmt.Printf("══════════════════════════════════════════\n")
 
 	return nil
 }
 
 func main() {
 	flag.Parse()
+	pinBrowserCache()
 
-	// Apply --unsafe limits
+	// Not under the TUI: os.Exit would leave the terminal stuck in the alt screen.
+	if *deadlineFlag > 0 {
+		if *noTUIFlag || *installFlag {
+			startDeadline(time.Duration(*deadlineFlag) * time.Second)
+		} else {
+			logWarn("--deadline needs --no-tui, ignoring it")
+		}
+	}
+
+	// Setup mode: fetch the browser and stop, with no prompts and no TUI.
+	if *installFlag {
+		if err := installBrowsers(); err != nil {
+			logFail("%v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Also setup: a reinstall that kept its data needs no collection at all.
+	if *stockedFlag > 0 {
+		if p, err := resolveDBPath(); err == nil {
+			if n := storedTokenCount(p); n >= *stockedFlag {
+				logOK("database already holds %d tokens, skipping collection", n)
+				return
+			}
+		}
+	}
+
+	// --unsafe raises the ceilings.
 	maxTokens := MaxTokens
 	maxBatch := MaxBatch
 	if *unsafeFlag {
 		maxTokens = UnsafeMaxTokens
 		maxBatch = UnsafeMaxBatch
-		fmt.Println("⚠️  --unsafe mode enabled: token limit=1500, batch limit=25")
+		logWarn("--unsafe enabled: token limit %d, batch limit %d", UnsafeMaxTokens, UnsafeMaxBatch)
 	}
 
 	reader := bufio.NewReader(os.Stdin)
@@ -1436,7 +1623,7 @@ func main() {
 				DefaultTokens, maxTokens)
 		}
 	} else if tokenCount > maxTokens {
-		fmt.Printf("⚠️  Capping tokens to max %d.\n", maxTokens)
+		logWarn("capping tokens to max %d", maxTokens)
 		tokenCount = maxTokens
 	}
 
@@ -1450,7 +1637,7 @@ func main() {
 				DefaultBatch, maxBatch)
 		}
 	} else if batchCount > maxBatch {
-		fmt.Printf("⚠️  Capping batch to max %d.\n", maxBatch)
+		logWarn("capping batch to max %d", maxBatch)
 		batchCount = maxBatch
 	}
 
@@ -1469,11 +1656,11 @@ func main() {
 	} else if parallelWorkers < 0 {
 		parallelWorkers = 0
 	} else if parallelWorkers > maxParallel {
-		fmt.Printf("⚠️  Capping parallel workers to max %d.\n", maxParallel)
+		logWarn("capping parallel workers to max %d", maxParallel)
 		parallelWorkers = maxParallel
 	}
 
-	// Set up before the plan is printed, so the plan lands in the TUI log.
+	// Set up before the plan prints, so the plan lands in the TUI log.
 	useTUI := !*noTUIFlag
 	var origStdout, origStderr *os.File
 	var pipeWriter *os.File
@@ -1491,8 +1678,8 @@ func main() {
 		os.Stdout = w
 		os.Stderr = w
 
-		// Goroutine: read piped output → logCapture ring buffer.
-		// Non-blocking; uses 1MB scanner buffer for long lines.
+		// Drains the pipe into the ring buffer. A 1 MB scanner buffer keeps long
+		// lines from aborting the scan.
 		go func() {
 			scanner := bufio.NewScanner(r)
 			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -1513,25 +1700,27 @@ func main() {
 		tuiStatus.Store("Starting...")
 	}
 
-	fmt.Printf("\n🎯 Plan: %d tokens × %d batches = %d total tokens",
+	plan := fmt.Sprintf("%d tokens x %d batches = %d total tokens",
 		tokenCount, batchCount, tokenCount*batchCount)
 	if parallelWorkers > 1 {
-		fmt.Printf("  (parallel: %d workers)", parallelWorkers)
+		plan += fmt.Sprintf(" (parallel: %d workers)", parallelWorkers)
 	}
-	fmt.Println()
+	logStep("plan", "%s", plan)
 
 	if !useTUI {
-		// Plain text mode — no TUI, original behaviour
+		// Plain text: no TUI, just stream the log.
 		if err := run(tokenCount, batchCount, parallelWorkers, *headedFlag); err != nil {
-			fmt.Fprintf(os.Stderr, "\n🚫 Fatal error: %v\n", err)
+			fmt.Println()
+			logFail("%v", err)
 			os.Exit(1)
 		}
-		fmt.Println("\n🎉 Script finished successfully.")
+		fmt.Println()
+		logDone("finished successfully")
 		return
 	}
 
-	// tea.WithOutput(origStdout) sends TUI rendering to the real terminal
-	// while fmt.Println goes to the pipe → logCapture.
+	// tea.WithOutput(origStdout) renders the TUI to the real terminal while
+	// fmt.Println goes to the pipe and into logCapture.
 	p := tea.NewProgram(tuiModel{},
 		tea.WithAltScreen(),
 		tea.WithOutput(origStdout),
@@ -1561,14 +1750,17 @@ func main() {
 	os.Stderr = origStderr
 
 	if v := tuiErr.Load(); v != nil {
-		fmt.Fprintf(os.Stderr, "\n🚫 Fatal error: %v\n", v.(error))
+		fmt.Println()
+		logFail("%v", v.(error))
 		os.Exit(1)
 	}
 
 	if !tuiDone.Load() {
-		fmt.Println("\n⏹️  Interrupted by user.")
+		fmt.Println()
+		logWarn("interrupted by user")
 		os.Exit(0)
 	}
 
-	fmt.Println("\n🎉 Script finished successfully.")
+	fmt.Println()
+	logDone("finished successfully")
 }

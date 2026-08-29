@@ -55,14 +55,21 @@ COPY --from=build /out/zai-api         /app/zai-api
 COPY --from=build /out/token-collector /app/token-collector
 RUN chmod +x /app/zai-api /app/token-collector
 
-# Baked in at build time, as requested. NOTE: this puts your ZAI_TOKEN and
-# AUTH_TOKEN into an image layer — anyone who can pull or export the image can
-# read them. Keep the image private, or drop this COPY and pass the values with
-# `env_file:` / `-e` at run time instead.
-COPY .env /app/.env
+# The CLI above installs the OS packages and the browsers, but it puts the driver
+# in the library's default cache. The collector pins its own driver directory, so
+# ask the collector itself to place it: same code path as runtime, which is what
+# guarantees the two agree. Browsers are already at PLAYWRIGHT_BROWSERS_PATH, so
+# this fetches only the driver, and the CLI's now-unreferenced copy is dropped.
+RUN /app/token-collector --install-browsers \
+ && rm -rf /root/.cache/ms-playwright-go
 
-# No entrypoint script: the proxy loads /app/.env itself, creates the token
-# store if it is missing, and its monitor collects the first batch in the
+# Config is NOT baked into the image: that would put ZAI_TOKEN and AUTH_TOKEN into
+# a layer anyone who pulls or exports it can read, and .env is gitignored so the
+# COPY also failed the build on a fresh clone. docker-compose passes it with
+# env_file at run time; for a bare `docker run`, use --env-file .env or -e.
+
+# No entrypoint script: the proxy reads its config from the environment, creates
+# the token store if missing, and its monitor collects the first batch in the
 # background — so `docker compose up -d` is all that is needed. tokens.sqlite
 # and logs live on the /data volume so they survive a container replacement.
 VOLUME ["/data"]

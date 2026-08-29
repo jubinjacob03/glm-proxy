@@ -1,7 +1,6 @@
 //go:build !windows
 
-// The tray supervisor is Windows-only. This stub keeps `go build ./...` and
-// `go vet ./...` working on other platforms.
+// The tray is Windows-only; this stub keeps build and vet working elsewhere.
 package main
 
 import "fmt"

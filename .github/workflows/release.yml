@@ -14,8 +14,28 @@ permissions:
   contents: write
 
 jobs:
+  # The race detector needs cgo and a C toolchain, which a Windows dev box usually
+  # lacks, so it runs here instead of never. Concurrency bugs in the proxy are the
+  # class most likely to reach production unnoticed.
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test with -race
+        run: go test -race -count=1 ./...
+
   build-windows:
     name: Build installer and publish release
+    needs: race
     runs-on: windows-latest
 
     steps:
@@ -77,6 +97,24 @@ jobs:
           Write-Host "--- release notes ---"
           Get-Content release-notes.md | Write-Host
 
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $files = @(
+            "installer\out\GLM-Proxy-Setup.exe",
+            "installer\staging\zai-api.exe",
+            "installer\staging\token-collector.exe",
+            "installer\staging\glm-tray.exe"
+          )
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash -Algorithm SHA256 -LiteralPath $f).Hash.ToLower()
+            "$h  $([System.IO.Path]::GetFileName($f))"
+          }
+          $out = "installer\out\SHA256SUMS.txt"
+          [IO.File]::WriteAllText($out, ($lines -join "`n") + "`n")
+          Write-Host "--- SHA256SUMS.txt ---"
+          Get-Content $out | Write-Host
+
       - name: Report artifact sizes
         shell: pwsh
         run: |
@@ -92,6 +130,7 @@ jobs:
           $tag = "${{ steps.version.outputs.tag }}"
           $assets = @(
             "installer\out\GLM-Proxy-Setup.exe",
+            "installer\out\SHA256SUMS.txt",
             "installer\staging\zai-api.exe",
             "installer\staging\token-collector.exe",
             "installer\staging\glm-tray.exe"
@@ -102,8 +141,15 @@ jobs:
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
+            # Re-publishing the same tag ships a build no client will ever take:
+            # the tray only updates when the version is strictly newer. Allow it
+            # only when asked for explicitly, so a forgotten APP_VERSION bump is
+            # a failed job rather than a release nobody receives.
+            if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch') {
+              throw "Release $tag already exists. Bump APP_VERSION in installer/installer.nsi, or re-run manually via workflow_dispatch to overwrite."
+            }
             Write-Host "Release $tag exists; updating notes and re-uploading assets."
-            gh release edit $tag --title "GLM Proxy $tag" --notes-file release-notes.md
+            gh release edit $tag --title "GLM Proxy $tag" --notes-file release-notes.md --latest
             if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
             gh release upload $tag @assets --clobber
             if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }

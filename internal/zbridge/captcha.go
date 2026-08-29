@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -20,24 +21,23 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver registration (no CGO)
 )
 
-// ============================================================================
-// DEVICE TOKEN STORE — SQLite, pure-Go driver (no CGO)
-// ============================================================================
+// Device token store. Each captcha verification spends exactly one token, so an
+// empty store fails every completion until the collector refills it.
 
 var (
 	stmtClaimToken *sql.Stmt
 	stmtCountToken *sql.Stmt
 
-	// tokenCount caches SELECT COUNT(*) so /health, /metrics and the
-	// replenishment monitor do not each drive an index scan.
+	// Caches SELECT COUNT(*) so /health, /metrics and the monitor do not each
+	// drive an index scan.
 	tokenCount     atomic.Int64
 	tokenCountAtNs atomic.Int64
 )
 
 const tokenCountTTL = 2 * time.Second
 
-// initDB opens the device-token store. The PRAGMAs mirror the collector's so
-// the two processes cooperate on the same file instead of colliding on locks.
+// initDB opens the device-token store. The PRAGMAs mirror the collector's so the
+// two processes share the file instead of colliding on locks.
 func initDB() error {
 	dsn := "file:" + filepath.ToSlash(dbPath) +
 		"?_pragma=busy_timeout(10000)" +
@@ -50,23 +50,22 @@ func initDB() error {
 	if err != nil {
 		return err
 	}
-	// SQLite serialises writes internally, so one connection avoids both pool
-	// overhead and lock contention.
+	// SQLite serialises writes anyway, so one connection avoids pool overhead and
+	// lock contention both.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
-	// Force the connection open so the PRAGMAs take effect now.
+	// Force it open now, so the PRAGMAs actually take effect.
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return err
 	}
 
-	// Create the schema if the file is new. This lets the proxy start against a
-	// fresh install with no tokens yet: it comes up, the token monitor fills the
-	// store in the background, and requests succeed once tokens arrive. Without
-	// this the prepared statements below would fail on a missing table. The
-	// collector uses the identical schema, so an existing store is unchanged.
+	// Created here so a fresh install boots with no tokens and fills in the
+	// background; without it the prepared statements below fail on a missing
+	// table. The collector uses the identical schema, so existing stores are
+	// untouched.
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tokens (
 		id    INTEGER PRIMARY KEY AUTOINCREMENT,
 		token TEXT    NOT NULL,
@@ -80,8 +79,8 @@ func initDB() error {
 		return fmt.Errorf("create tokens index: %w", err)
 	}
 
-	// Claim-and-delete in one statement so two concurrent generators can never
-	// be handed the same token.
+	// Claim and delete in one statement, so two concurrent generators can never
+	// receive the same token.
 	claim, err := db.Prepare(
 		`DELETE FROM tokens WHERE id = (SELECT id FROM tokens ORDER BY id LIMIT 1) RETURNING token`)
 	if err != nil {
@@ -100,7 +99,28 @@ func initDB() error {
 	return nil
 }
 
-// closeDB releases the prepared statements and the connection.
+// quarantineTokenDB renames a damaged store aside, with its WAL and shared-memory
+// siblings, so a fresh initDB can recreate it. The tokens it held are disposable.
+func quarantineTokenDB() error {
+	stamp := time.Now().Format("20060102-150405")
+	moved := false
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		src := dbPath + suffix
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		if err := os.Rename(src, dbPath+".corrupt-"+stamp+suffix); err != nil {
+			return err
+		}
+		moved = true
+	}
+	if !moved {
+		return fmt.Errorf("no database file at %s to quarantine", dbPath)
+	}
+	return nil
+}
+
+// closeDB releases the prepared statements, then the connection.
 func closeDB() {
 	if stmtClaimToken != nil {
 		stmtClaimToken.Close()
@@ -116,8 +136,8 @@ func closeDB() {
 	}
 }
 
-// claimToken atomically removes and returns the oldest device token. A token
-// is single-use, so claiming and deleting are the same operation.
+// claimToken removes and returns the oldest token. Tokens are single-use, so
+// claiming and deleting are one operation.
 func claimToken() (string, bool) {
 	if stmtClaimToken == nil {
 		logError("token store is not open")
@@ -128,7 +148,10 @@ func claimToken() (string, bool) {
 		if errors.Is(err, sql.ErrNoRows) {
 			tokenCount.Store(0)
 			tokenCountAtNs.Store(time.Now().UnixNano())
-			logError("No device tokens available in table 'tokens'")
+			// Not an error here: an empty store is normal on a fresh install and
+			// the caller reports it with the context needed to act. As [ERROR] it
+			// made first-run priming look like a fault.
+			logDebugf("device token store is empty")
 		} else {
 			logError("Failed to claim device token: " + err.Error())
 		}
@@ -141,8 +164,8 @@ func claimToken() (string, bool) {
 	return token, true
 }
 
-// getTokenCount reports the device tokens left in the store, served from a
-// short-TTL cache so status endpoints stay free to poll.
+// getTokenCount reports tokens left, from a short-TTL cache so status endpoints
+// stay free to poll.
 func getTokenCount() int {
 	if last := tokenCountAtNs.Load(); last != 0 &&
 		time.Now().UnixNano()-last < int64(tokenCountTTL) {
@@ -165,10 +188,7 @@ func refreshTokenCount() int {
 	return count
 }
 
-// ============================================================================
-// ALIYUN SIGNATURE
-// ============================================================================
-
+// generateSignature is the HMAC-SHA1 Aliyun expects, over key-sorted parameters.
 func generateSignature(params map[string]string, secKey string) string {
 	keys := make([]string, 0, len(params)+1)
 	for k := range params {
@@ -212,13 +232,8 @@ func buildQueryString(params map[string]string) string {
 	return b.String()
 }
 
-// ============================================================================
-// ALIYUN HTTP
-// ============================================================================
-
-// postForm submits a form-encoded body and decodes the JSON reply into dst.
-// Decoding straight off the wire avoids buffering the response and copying it
-// twice on the way to json.Unmarshal.
+// postForm posts a form body and decodes the JSON reply into dst. Decoding off the
+// wire avoids buffering the response and copying it twice.
 func postForm(targetURL, body string, extraHeaders map[string]string, dst interface{}) error {
 	req, err := http.NewRequest("POST", targetURL, strings.NewReader(body))
 	if err != nil {
@@ -242,10 +257,11 @@ func postForm(targetURL, body string, extraHeaders map[string]string, dst interf
 	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(dst)
 }
 
-// ============================================================================
-// CAPTCHA GENERATION — PART 1: InitCaptchaV3
-// ============================================================================
+// The captcha handshake, in the order tryCompute runs it: initCaptcha to get a
+// certifyID, generateArg and aliHash over the fake interaction track, encrypt,
+// then verifyCaptcha to trade it all for a verification parameter.
 
+// initCaptcha opens a handshake and returns its certifyID.
 func initCaptcha() (string, error) {
 	params := map[string]string{
 		"AccessKeyId":      accessKey,
@@ -272,9 +288,8 @@ func initCaptcha() (string, error) {
 	return result.CertifyID, nil
 }
 
-// ============================================================================
-// CAPTCHA GENERATION — PART 2: Generate arg (RC4-like stream cipher)
-// ============================================================================
+// generateArg derives arg with an RC4-like cipher keyed by certifyID, permuted
+// through argPermTable.
 
 var argPermTable = [64]int{
 	32, 50, 10, 51, 6, 44, 37, 16, 46, 11, 62, 19, 43, 25, 23, 30,
@@ -288,7 +303,7 @@ const argConstant = "4xrihv8zb8tf1mfj"
 func generateArg(certifyID string) string {
 	encoded := urlEncode(certifyID, "")
 
-	// URL-decode (identity for already-decoded strings, kept for faithfulness)
+	// Identity for already-decoded strings; kept to mirror the original.
 	o := make([]byte, 0, len(encoded))
 	for i := 0; i < len(encoded); {
 		if encoded[i] == '%' && i+2 < len(encoded) {
@@ -300,7 +315,7 @@ func generateArg(certifyID string) string {
 		}
 	}
 
-	// KSA
+	// Key-scheduling: permute the state from the key.
 	r := argPermTable
 	n := argConstant
 	rlen := 64
@@ -314,7 +329,7 @@ func generateArg(certifyID string) string {
 		i++
 	}
 
-	// PRGA
+	// Keystream generation, XORed into the output.
 	t := make([]byte, 0, len(o))
 	e, a := 0, 0
 	for idx := 0; idx < len(o); idx++ {
@@ -333,10 +348,8 @@ func generateArg(certifyID string) string {
 	return base64Encode(t)
 }
 
-// ============================================================================
-// CAPTCHA GENERATION — PART 4: ali_hash (custom hash with 16-byte state)
-// ============================================================================
-
+// aliHash is Aliyun's custom hash over a 16-byte state. Reverse-engineered from
+// the Fielin VM bundle; see .assets/reports for the derivation.
 func aliHash(inputStr, saltStr string) string {
 	o := inputStr
 	r := saltStr
@@ -385,9 +398,7 @@ func aliHash(inputStr, saltStr string) string {
 	return string(result[:])
 }
 
-// ============================================================================
-// CAPTCHA GENERATION — PART 7: encrypt (same RC4-like cipher, different key)
-// ============================================================================
+// encrypt applies the same RC4-like cipher as generateArg under a fixed key.
 
 const encryptKey = "3e627e1b4c63f913"
 
@@ -424,10 +435,8 @@ func encrypt(plaintext []byte) string {
 	return base64Encode(t)
 }
 
-// ============================================================================
-// ZLIB COMPRESS — pooled writer, pooled output buffer
-// ============================================================================
-
+// zlibCompress uses a pooled writer and output buffer: this runs once per
+// captcha, which is once per request in the worst case.
 func zlibCompress(data []byte) []byte {
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
@@ -445,10 +454,8 @@ func zlibCompress(data []byte) []byte {
 	return result
 }
 
-// ============================================================================
-// CAPTCHA GENERATION — PART 8: VerifyCaptchaV3
-// ============================================================================
-
+// verifyCaptcha spends the device token and returns the verification parameter.
+// This is the only call that consumes a token.
 func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
 	cvpJSON, err := jsonMarshal(CVP{
 		CertifyID:   certifyID,
@@ -506,16 +513,65 @@ func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
 	return "", nil
 }
 
-// ============================================================================
-// CAPTCHA VERIFY PARAM
-// ============================================================================
-
 // errNoDeviceTokens signals an empty local token store: retrying cannot help,
 // only the collector can.
 var errNoDeviceTokens = errors.New("no device tokens remaining")
 
-// computeFinalPayload produces one Aliyun CaptchaVerifyParam, retrying on
-// transient failures with a short backoff.
+// tokenDemand lets a request that hit an empty store ask the monitor to collect
+// now rather than waiting out its poll interval.
+var tokenDemand = make(chan struct{}, 1)
+
+// collectorHealthy reports whether the monitor is running and its last run
+// succeeded. Waiting on a working collector is worth it; waiting on a broken one
+// would stall every request for the full captcha budget, so that case fails fast.
+var collectorHealthy atomic.Bool
+
+// requestTokenCollection nudges the monitor. Non-blocking: one pending request is
+// enough, since a run collects a whole batch.
+func requestTokenCollection() {
+	select {
+	case tokenDemand <- struct{}{}:
+	default:
+	}
+}
+
+// waitForDeviceTokens blocks until the collector stocks the store or ctx runs
+// out. A fresh install starts empty, and collection takes about half a minute
+// once the browser is cached, so waiting turns what used to be a guaranteed
+// failure into a merely slow first request.
+func waitForDeviceTokens(ctx context.Context) bool {
+	if getTokenCount() > 0 {
+		return true
+	}
+	if !collectorHealthy.Load() {
+		// Nothing will refill it: the monitor is off, or its collector is failing.
+		return false
+	}
+	requestTokenCollection()
+	logConsolef("[Tokens] store is empty; holding this request while the collector stocks it " +
+		"(a first run downloads a browser too, so allow a minute or two)")
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			if getTokenCount() > 0 {
+				logConsolef("[Tokens] tokens available; resuming the held request")
+				return true
+			}
+			if !collectorHealthy.Load() {
+				logConsolef("[Tokens] collector is not succeeding; releasing the held request")
+				return false
+			}
+		}
+	}
+}
+
+// computeFinalPayload produces one CaptchaVerifyParam, retrying transient
+// failures with a short backoff.
 func computeFinalPayload(ctx context.Context) string {
 	backoff := 250 * time.Millisecond
 	for attempt := 1; attempt <= maxTokenRetries; attempt++ {
@@ -528,9 +584,14 @@ func computeFinalPayload(ctx context.Context) string {
 		case err == nil && payload != "":
 			return payload
 		case errors.Is(err, errNoDeviceTokens):
-			logError(fmt.Sprintf("No device tokens remaining (attempt %d/%d) — waiting on the collector",
-				attempt, maxTokenRetries))
-			return ""
+			// Only the collector can fix this, and it usually needs a moment, so
+			// wait and retry rather than failing the caller.
+			if !waitForDeviceTokens(ctx) {
+				logError(fmt.Sprintf("No device tokens arrived within the request budget (attempt %d/%d)",
+					attempt, maxTokenRetries))
+				return ""
+			}
+			continue
 		case err != nil:
 			logError(fmt.Sprintf("Captcha attempt %d/%d failed: %v", attempt, maxTokenRetries, err))
 		default:
@@ -540,8 +601,8 @@ func computeFinalPayload(ctx context.Context) string {
 		if attempt == maxTokenRetries {
 			break
 		}
-		// Back off instead of hammering Aliyun (and burning a token per
-		// attempt) as fast as the loop can run.
+		// Back off rather than hammering Aliyun, and burning a token per attempt,
+		// as fast as the loop can run.
 		select {
 		case <-ctx.Done():
 			return ""
@@ -555,12 +616,9 @@ func computeFinalPayload(ctx context.Context) string {
 	return ""
 }
 
-// tryCompute runs one full captcha handshake.
-//
-// The device token is claimed as late as possible — right before the only
-// call that consumes it. Previously it was claimed first and deleted even
-// when InitCaptchaV3 or the local crypto failed, so every upstream hiccup
-// permanently destroyed a token that the collector then had to re-earn
+// tryCompute runs one full captcha handshake. The device token is claimed as
+// late as possible, right before the only call that spends it: claiming first
+// meant every upstream hiccup destroyed a token the collector had to re-earn
 // through a headless browser run.
 func tryCompute() (string, error) {
 	certifyID, err := initCaptcha()
@@ -590,8 +648,7 @@ func tryCompute() (string, error) {
 	fb64 := base64Encode(compressed)
 	finalVal := encrypt([]byte(fb64))
 
-	// Claimed as late as possible: this is the only call that spends the
-	// token, so earlier failures cost nothing.
+	// The only call that spends the token, so earlier failures cost nothing.
 	deviceToken, ok := claimToken()
 	if !ok {
 		return "", errNoDeviceTokens
@@ -604,9 +661,8 @@ func tryCompute() (string, error) {
 	return payload, nil
 }
 
-// ============================================================================
-// CAPTCHA CACHE — background generation so requests do not pay the handshake
-// ============================================================================
+// Background cache, so an agent-mode request does not pay for the handshake
+// inline. It pauses while idle rather than spending tokens on nobody.
 
 type cachedCaptcha struct {
 	value       string
@@ -629,7 +685,7 @@ func (c *CaptchaCache) markActive() {
 	c.mu.Unlock()
 }
 
-// stats reports the cache depth and how many parameters are being generated.
+// stats reports cache depth and how many parameters are in flight.
 func (c *CaptchaCache) stats() (depth, pending int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -666,8 +722,8 @@ func (c *CaptchaCache) Get() (string, bool) {
 	return "", false
 }
 
-// Run keeps the cache stocked while the bridge is being used. On cancellation
-// it waits for in-flight generations rather than abandoning them mid-handshake.
+// Run keeps the cache stocked while the bridge is in use, and on cancellation
+// waits for in-flight generations rather than abandoning them mid-handshake.
 func (c *CaptchaCache) Run(ctx context.Context) {
 	select {
 	case <-ctx.Done():
@@ -691,8 +747,8 @@ func (c *CaptchaCache) Run(ctx context.Context) {
 		}
 
 		c.mu.Lock()
-		// Each cached parameter costs a device token and expires unused, so
-		// restocking while nobody is calling is a slow token leak.
+		// Each parameter costs a token and expires unused, so restocking while
+		// nobody is calling is a slow token leak.
 		if time.Since(c.lastActive) > config.Captcha.IdleWindow {
 			c.mu.Unlock()
 			continue
@@ -713,8 +769,7 @@ func (c *CaptchaCache) Run(ctx context.Context) {
 
 func (c *CaptchaCache) generate(ctx context.Context) {
 	defer c.wg.Done()
-	// Released via defer so a panic in the handshake cannot leak a slot;
-	// enough leaked slots would starve the cache permanently.
+	// Deferred so a panic cannot leak a slot; enough leaks starve the cache.
 	defer func() {
 		c.mu.Lock()
 		c.generating--
@@ -738,9 +793,20 @@ func (c *CaptchaCache) generate(ctx context.Context) {
 		time.Since(startedAt).Seconds(), depth)
 }
 
-// getCaptchaVerifyParam returns a verification parameter for one upstream
-// request, from the cache when agent mode keeps one warm, otherwise by running
-// the handshake inline.
+// captchaUnavailableError names the actual cause instead of the internal symptom
+// "empty payload". An unstocked token store is by far the most common reason and
+// the only one the user can act on.
+func captchaUnavailableError() error {
+	if getTokenCount() == 0 {
+		return errors.New("device token store is empty and the collector has not stocked it yet; " +
+			"a fresh install downloads a browser first, so give it a minute and retry — " +
+			"the tray Monitor window shows [Tokens] and [Collector] progress")
+	}
+	return errors.New("could not generate captcha verification; the proxy log records the failing step")
+}
+
+// getCaptchaVerifyParam returns one parameter, from the cache when agent mode
+// keeps one warm, otherwise by running the handshake inline.
 func getCaptchaVerifyParam(ctx context.Context) (string, error) {
 	captchaCache.markActive()
 
@@ -757,8 +823,8 @@ func getCaptchaVerifyParam(ctx context.Context) (string, error) {
 	startedAt := time.Now()
 	logDebugf("[Captcha] computing CaptchaVerifyParam")
 
-	// Derived from the caller's context so a client that walks away stops the
-	// handshake rather than spending tokens on a reply nobody will read.
+	// From the caller's context, so a client that walks away stops the handshake
+	// instead of spending tokens on a reply nobody reads.
 	genCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
@@ -771,7 +837,7 @@ func getCaptchaVerifyParam(ctx context.Context) (string, error) {
 	go func() {
 		payload := computeFinalPayload(genCtx)
 		if payload == "" {
-			ch <- result{"", errors.New("captcha generation returned empty payload")}
+			ch <- result{"", captchaUnavailableError()}
 			return
 		}
 		ch <- result{payload, nil}
