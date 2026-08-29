@@ -137,7 +137,7 @@ func TestToolCallStreamShape(t *testing.T) {
 
 	oldBase := BASE_URL
 	BASE_URL = upstream.URL
-	defer func() { BASE_URL = oldBase }()
+	defer func() { DrainSessionGC(); BASE_URL = oldBase }()
 
 	defer OverrideSessionState("test-token", "test-user", true)()
 

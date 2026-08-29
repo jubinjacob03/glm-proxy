@@ -64,7 +64,7 @@ func TestHTTPEndToEndGarbleFix(t *testing.T) {
 	// Point the bridge at it.
 	oldBase := zbridge.BASE_URL
 	zbridge.BASE_URL = upstream.URL
-	defer func() { zbridge.BASE_URL = oldBase }()
+	defer func() { zbridge.DrainSessionGC(); zbridge.BASE_URL = oldBase }()
 
 	// Pre-seed the session, skipping real guest auth.
 	defer zbridge.OverrideSessionState("test-token", "test-user", true)()

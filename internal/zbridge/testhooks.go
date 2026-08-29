@@ -22,6 +22,11 @@ func OverrideSessionState(token, userID string, initialized bool) func() {
 	}
 }
 
+// DrainSessionGC waits for background session deletes to finish. A completion
+// spawns a detached goroutine that reads BASE_URL; tests must drain it before
+// restoring BASE_URL, or the restore races that read.
+func DrainSessionGC() { waitForSessionGC(sessionGCDrain) }
+
 // SeedCaptchaParam pushes a ready-made param into the agent-mode cache so
 // requests skip the Aliyun handshake. Tests only; live, captchaCache.Run fills it.
 func SeedCaptchaParam(value string) {
