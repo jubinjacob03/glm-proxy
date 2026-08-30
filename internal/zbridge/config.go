@@ -42,8 +42,7 @@ type Config struct {
 	}
 	ZaiToken  string
 	AgentMode bool
-	// Which shim: "modern" (XML-sectioned prompt, agent.go) or "legacy"
-	// ([ROLE: ...] rewrite, agent_legacy.go).
+	// Shim: "native" (default, role-preserving), "modern" (folded), or "legacy".
 	AgentModeVariant string
 	Logging          struct {
 		Level  string // LOG_LEVEL: debug, info, warn, error, off
@@ -193,7 +192,8 @@ func loadConfig() *Config {
 	c.Timeouts.Default = 300000
 	c.ZaiToken = ""
 	c.AgentMode = false
-	c.AgentModeVariant = "modern"
+	// Default "native" (role-preserving); "modern" (folded) is the fallback.
+	c.AgentModeVariant = "native"
 	// Not debug: that logs every SSE line and full bodies, putting a mutex, a
 	// file write and a console syscall on the hottest path in the process.
 	c.Logging.Level = "info"
@@ -243,8 +243,15 @@ func loadConfig() *Config {
 	}
 	if am := os.Getenv("AGENT_MODE"); am != "" {
 		switch strings.ToLower(am) {
-		case "1", "true", "yes", "on", "modern":
+		case "1", "true", "yes", "on":
 			c.AgentMode = true
+		case "native":
+			c.AgentMode = true
+			c.AgentModeVariant = "native"
+		case "modern":
+			// Opt in to the folded prompt shim (native is the default).
+			c.AgentMode = true
+			c.AgentModeVariant = "modern"
 		case "legacy":
 			// Opt in to the old [ROLE: ...] shim.
 			c.AgentMode = true
@@ -260,6 +267,8 @@ func loadConfig() *Config {
 			c.AgentModeVariant = "legacy"
 		case "modern":
 			c.AgentModeVariant = "modern"
+		case "native":
+			c.AgentModeVariant = "native"
 		}
 	}
 	if l := os.Getenv("LOG_LEVEL"); l != "" {
@@ -324,9 +333,16 @@ var config = func() *Config {
 	return c
 }()
 
-// agentModern reports whether the modern shim is active.
+// agentModern reports whether a modern-family shim is active (native or folded);
+// both share the <<<TOOL_CALL>>> response path.
 func (c *Config) agentModern() bool {
 	return c.AgentMode && !strings.EqualFold(c.AgentModeVariant, "legacy")
+}
+
+// agentNative reports whether the native role-preserving transform is active
+// (the default). AGENT_MODE_VARIANT=modern selects the folded fallback.
+func (c *Config) agentNative() bool {
+	return c.agentModern() && strings.EqualFold(c.AgentModeVariant, "native")
 }
 
 // agentLegacy reports whether the legacy shim is active.

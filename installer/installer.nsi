@@ -16,7 +16,7 @@ SetCompressor /SOLID lzma
 !define APP_NAME    "GLM Proxy"
 !define APP_ID      "GLM-Proxy"
 !define PUBLISHER   "Jubin"
-!define APP_VERSION "2.0.0"
+!define APP_VERSION "2.1.0"
 !define TRAY_EXE    "glm-tray.exe"
 !define UNINST_KEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
 !define RUN_KEY     "Software\Microsoft\Windows\CurrentVersion\Run"

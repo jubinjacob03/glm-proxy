@@ -375,17 +375,28 @@ func sendToZAI(ctx context.Context, prompt string, opts SendOptions) (<-chan ZAI
 		FeaturesMap       map[string]interface{}
 		Messages          []Message
 		ClientMessagesRaw json.RawMessage
+		SignaturePrompt   string
 	}{
 		Model:             model,
 		ChatID:            chatID,
 		FeaturesMap:       featuresMap,
 		Messages:          messages,
 		ClientMessagesRaw: opts.ClientMessagesRaw,
+		SignaturePrompt:   opts.SignaturePrompt,
 	}
 
 	ch := make(chan ZAIResult, 100)
 	go func() {
 		defer close(ch)
+		defer func() {
+			if rec := recover(); rec != nil {
+				logPanic("zai producer", rec)
+				select {
+				case ch <- ZAIResult{Err: errors.New("internal error: upstream producer failed")}:
+				case <-ctx.Done():
+				}
+			}
+		}()
 		err := sendToZAIStream(ctx, prompt, resolvedOpts, ch)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -405,6 +416,7 @@ func sendToZAIStream(ctx context.Context, prompt string, opts struct {
 	FeaturesMap       map[string]interface{}
 	Messages          []Message
 	ClientMessagesRaw json.RawMessage
+	SignaturePrompt   string
 }, ch chan<- ZAIResult) error {
 
 	for attempt := 0; attempt < 2; attempt++ {
@@ -417,7 +429,13 @@ func sendToZAIStream(ctx context.Context, prompt string, opts struct {
 		feVersion := session.FeVersion
 		session.mu.Unlock()
 
-		signature, _, _ := generateZaSignature(prompt, token, userID)
+		// Sign and send the latest user turn; the two must cover the same bytes.
+		sigContent := opts.SignaturePrompt
+		if sigContent == "" {
+			sigContent = prompt
+		}
+
+		signature, _, _ := generateZaSignature(sigContent, token, userID)
 		urlStr := BASE_URL + "/api/v2/chat/completions"
 
 		var messagesField interface{}
@@ -452,7 +470,7 @@ func sendToZAIStream(ctx context.Context, prompt string, opts struct {
 			"model":                opts.Model,
 			"chat_id":              opts.ChatID,
 			"messages":             messagesField,
-			"signature_prompt":     prompt,
+			"signature_prompt":     sigContent,
 			"stream":               true,
 			"captcha_verify_param": captchaParam,
 			"features":             featuresPayload,

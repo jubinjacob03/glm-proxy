@@ -194,6 +194,7 @@ func (p *SessionPool) Start() {
 		p.wg.Add(1)
 		go func() {
 			defer p.wg.Done()
+			defer recoverGoroutine("session pool warmup")
 			p.fillSlot("warmup")
 		}()
 	}
@@ -232,6 +233,7 @@ func (p *SessionPool) Release(sessionID string) {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		defer recoverGoroutine("session pool release")
 		p.deleteOne(sessionID, "used")
 		if p.stopped.Load() {
 			return // shutting down: retire only, don't rebuild the batch
@@ -445,6 +447,7 @@ func gcSessions(reason string, sessionIDs ...string) {
 	sessionGCWait.Add(1)
 	go func() {
 		defer sessionGCWait.Done()
+		defer recoverGoroutine("session GC")
 		// Its own context, because the triggering request may already be gone.
 		ctx, cancel := context.WithTimeout(context.Background(), poolOpTimeout)
 		defer cancel()

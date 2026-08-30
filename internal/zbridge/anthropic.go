@@ -406,6 +406,9 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	prompt := messagesToPrompt(messages)
 
+	// signature_prompt = the last user message of what is actually sent.
+	signaturePrompt := lastUserPromptText(messages)
+
 	upstreamModel := model
 	if len(imageParts) > 0 && !modelSupportsVision(model) {
 		if vm := resolveVisionModel(model); vm != "" {
@@ -420,7 +423,9 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		Model:             upstreamModel,
 		ChatID:            chatID,
 		ClientMessagesRaw: transformedMessages,
+		ToolsRaw:          body.Tools,
 		ReasoningEffort:   body.ReasoningEffort,
+		SignaturePrompt:   signaturePrompt,
 	}
 
 	if body.Reasoning != nil {
@@ -486,6 +491,7 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer recoverGoroutine("anthropic keep-alive")
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -592,7 +598,7 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 
 	var interceptor agentInterceptor
 	if config.AgentMode {
-		interceptor = newAgentInterceptor()
+		interceptor = newAgentInterceptor(opts.ToolsRaw)
 	}
 
 	var contentBuf strings.Builder
@@ -640,7 +646,7 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 			// A deep edit_content rewrite rewound already-forwarded text, so the
 			// interceptor's view is stale; reset it (issue #23).
 			if interceptor != nil {
-				interceptor = newAgentInterceptor()
+				interceptor = newAgentInterceptor(opts.ToolsRaw)
 			}
 		}
 		if result.FullText != "" {
@@ -674,19 +680,24 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 	}
 
 	// Drain the interceptor tail: trailing text plus any call whose block only
-	// completed at end of stream (the modern shim's hold-back window).
+	// completed at end of stream. rem is already tool-markup-free; strip once
+	// more so a raw block can never leak if the safety net parses it, while any
+	// surrounding prose is preserved.
 	if interceptor != nil {
 		rem, tailCalls := interceptor.finish()
-		if !toolCallEmitted {
-			emitText(rem)
+		if rem != "" {
+			if clean := agentStripToolCalls(rem); clean != "" {
+				emitText(clean)
+			}
 		}
 		for _, tc := range tailCalls {
 			emitToolCallEvent(tc)
 		}
 
-		// Safety net: re-scan the whole text at stream end.
+		// Safety net: re-scan the whole text so a held block becomes tool_calls
+		// instead of leaking as content.
 		if !toolCallEmitted {
-			for _, tc := range agentExtractToolCalls(fullContent) {
+			for _, tc := range agentExtractToolCalls(fullContent, opts.ToolsRaw) {
 				emitToolCallEvent(tc)
 			}
 		}
@@ -766,7 +777,7 @@ func anthropicNonStreamResponse(ctx context.Context, w http.ResponseWriter, prom
 	}
 
 	if config.AgentMode {
-		toolCalls := agentExtractToolCalls(fullContent)
+		toolCalls := agentExtractToolCalls(fullContent, opts.ToolsRaw)
 		if len(toolCalls) > 0 {
 			stripped := agentStripToolCalls(fullContent)
 			if stripped != "" {

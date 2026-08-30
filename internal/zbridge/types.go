@@ -57,7 +57,11 @@ type SendOptions struct {
 	ChatID            string
 	Messages          []Message
 	ClientMessagesRaw json.RawMessage
+	ToolsRaw          json.RawMessage
 	ReasoningEffort   string // "high" or "max"; forwarded only if the model supports it
+	// SignaturePrompt is signed and sent as signature_prompt (the latest user
+	// turn). Empty falls back to the flat prompt.
+	SignaturePrompt string
 }
 
 type ResponseResult struct {
