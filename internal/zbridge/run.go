@@ -57,8 +57,8 @@ func NewHandler() http.Handler {
 func Run() {
 	flag.StringVar(&dbPath, "db-path", "tokens.sqlite", "Path to SQLite database")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
-	flag.BoolVar(&config.AgentMode, "agent-mode", config.AgentMode, "Enable agent mode: translate tools & roles for Z.AI compatibility (modern shim by default)")
-	flag.StringVar(&config.AgentModeVariant, "agent-mode-variant", config.AgentModeVariant, "Agent mode shim variant: modern (default, XML-sectioned prompt) or legacy ([ROLE: ...] rewrite)")
+	flag.BoolVar(&config.AgentMode, "agent-mode", config.AgentMode, "Enable agent mode: translate tools & roles for Z.AI compatibility (native role-preserving passthrough by default)")
+	flag.StringVar(&config.AgentModeVariant, "agent-mode-variant", config.AgentModeVariant, "Agent mode shim variant: native (default, role-preserving passthrough), modern (XML-sectioned fold), or legacy ([ROLE: ...] rewrite)")
 	flag.BoolVar(&config.SyncMode, "sync-mode", config.SyncMode, "Legacy synchronous session flow: create a fresh chat per request instead of drawing from the pre-warmed session pool (used sessions are still deleted on Z.AI after each response)")
 	flag.Parse()
 
@@ -127,6 +127,7 @@ func Run() {
 		background.Add(1)
 		go func() {
 			defer background.Done()
+			defer recoverGoroutine("token monitor")
 			tokenMonitor(bgCtx)
 		}()
 	}
@@ -135,12 +136,16 @@ func Run() {
 		background.Add(1)
 		go func() {
 			defer background.Done()
+			defer recoverGoroutine("captcha cache")
 			captchaCache.Run(bgCtx)
 		}()
 		logInfof("Agent mode: captcha background cache started")
-		if config.agentModern() {
+		switch {
+		case config.agentNative():
+			logInfof("Agent mode variant: NATIVE (role-preserving passthrough)")
+		case config.agentModern():
 			logInfof("Agent mode variant: MODERN (XML-sectioned prompt shim)")
-		} else {
+		default:
 			logInfof("Agent mode variant: LEGACY ([ROLE: ...] rewrite shim)")
 		}
 	}
@@ -155,6 +160,7 @@ func Run() {
 	background.Add(1)
 	go func() {
 		defer background.Done()
+		defer recoverGoroutine("session init")
 		if err := initializeSession(); err != nil {
 			logConsolef("[Startup] Session init deferred — will retry on first request.")
 		}
@@ -331,6 +337,8 @@ func addrForDisplay() string {
 
 func agentModeLabel() string {
 	switch {
+	case config.agentNative():
+		return "on (native)"
 	case config.agentModern():
 		return "on (modern shim)"
 	case config.agentLegacy():

@@ -185,6 +185,12 @@ func newFakeRelease(t *testing.T, tag string, payload []byte, sum string) *httpt
 		}
 		json.NewEncoder(w).Encode(rel)
 	})
+	// latestTag reads the tag from this redirect's Location header, so the mock
+	// must serve it or the lookup escapes to real github.com.
+	mux.HandleFunc("/"+updateRepo+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "/"+updateRepo+"/releases/tag/"+tag)
+		w.WriteHeader(http.StatusFound)
+	})
 	return srv
 }
 
@@ -202,6 +208,7 @@ func TestCheckOnceStagesVerifiedUpdate(t *testing.T) {
 	var notified string
 	u := newUpdater(t.TempDir(), func(v string) { notified = v })
 	u.apiBase = srv.URL
+	u.webBase = srv.URL
 
 	if err := u.checkOnce(context.Background()); err != nil {
 		t.Fatalf("checkOnce: %v", err)
@@ -242,6 +249,7 @@ func TestCheckOnceRejectsBadChecksum(t *testing.T) {
 
 	u := newUpdater(t.TempDir(), nil)
 	u.apiBase = srv.URL
+	u.webBase = srv.URL
 
 	err := u.checkOnce(context.Background())
 	if err == nil {
@@ -270,6 +278,7 @@ func TestCheckOnceIgnoresSameOrOlderRelease(t *testing.T) {
 
 	u := newUpdater(t.TempDir(), func(string) { t.Error("callback must not fire for an older release") })
 	u.apiBase = srv.URL
+	u.webBase = srv.URL
 
 	if err := u.checkOnce(context.Background()); err != nil {
 		t.Fatalf("checkOnce: %v", err)
@@ -296,6 +305,7 @@ func TestCheckOnceRefusesReleaseWithoutChecksums(t *testing.T) {
 
 	u := newUpdater(t.TempDir(), nil)
 	u.apiBase = srv.URL
+	u.webBase = srv.URL
 
 	err := u.checkOnce(context.Background())
 	if err == nil || !strings.Contains(err.Error(), updateChecksumName) {
@@ -326,6 +336,7 @@ func TestCheckOnceSkipsDraftAndPrerelease(t *testing.T) {
 
 		u := newUpdater(t.TempDir(), func(string) { t.Errorf("%s must not be staged", mode) })
 		u.apiBase = srv.URL
+		u.webBase = srv.URL
 		if err := u.checkOnce(context.Background()); err != nil {
 			t.Errorf("%s: %v", mode, err)
 		}
@@ -345,6 +356,7 @@ func TestCheckOnceWritesPendingFlag(t *testing.T) {
 
 	u := newUpdater(t.TempDir(), nil)
 	u.apiBase = srv.URL
+	u.webBase = srv.URL
 	if err := u.checkOnce(context.Background()); err != nil {
 		t.Fatalf("checkOnce: %v", err)
 	}
@@ -682,6 +694,7 @@ func TestFetchLatestGivesUpOnASilentServer(t *testing.T) {
 
 	u := newUpdater(t.TempDir(), nil)
 	u.apiBase = srv.URL
+	u.webBase = srv.URL
 
 	start := time.Now()
 	_, err := u.fetchLatest(context.Background())

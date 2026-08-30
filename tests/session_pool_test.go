@@ -234,7 +234,7 @@ func mockZAI(t *testing.T, baseURL string) {
 	t.Helper()
 	oldBase := zbridge.BASE_URL
 	zbridge.BASE_URL = baseURL
-	t.Cleanup(func() { zbridge.BASE_URL = oldBase })
+	t.Cleanup(func() { zbridge.DrainSessionGC(); zbridge.BASE_URL = oldBase })
 	t.Cleanup(zbridge.OverrideSessionState("test-token", "test-user", true))
 }
 

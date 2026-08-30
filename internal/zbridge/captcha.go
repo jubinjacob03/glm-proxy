@@ -835,6 +835,15 @@ func getCaptchaVerifyParam(ctx context.Context) (string, error) {
 	ch := make(chan result, 1)
 
 	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				logPanic("captcha payload", rec)
+				select {
+				case ch <- result{"", captchaUnavailableError()}:
+				default:
+				}
+			}
+		}()
 		payload := computeFinalPayload(genCtx)
 		if payload == "" {
 			ch <- result{"", captchaUnavailableError()}

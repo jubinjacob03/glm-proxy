@@ -72,7 +72,7 @@ func TestParseAgentToolCallsTolerantMarkers(t *testing.T) {
 		{"<<<<TOOL_CALL>>>>\n{\"name\":\"bash\",\"arguments\":{}}\n<<<<END_TOOL_CALL>>>>", "{}"},
 	}
 	for _, c := range cases {
-		calls := ParseAgentToolCalls(c.text)
+		calls := ParseAgentToolCalls(c.text, nil)
 		if len(calls) != 1 {
 			t.Fatalf("ParseAgentToolCalls(%q...) => %d calls, want 1", c.text[:12], len(calls))
 		}
@@ -108,7 +108,7 @@ func TestNormalizeAgentFencesTolerantMarkers(t *testing.T) {
 const flatPayload = `<<<TOOL_CALL>>>{"tool": "bash", "command": "curl -s ifconfig.me", "timeout": 10}<<<END_TOOL_CALL>>>`
 
 func TestParseAgentToolCallsFlatPayload(t *testing.T) {
-	calls := ParseAgentToolCalls(flatPayload)
+	calls := ParseAgentToolCalls(flatPayload, nil)
 	if len(calls) != 1 {
 		t.Fatalf("ParseAgentToolCalls(flat payload) => %d calls, want 1", len(calls))
 	}
@@ -148,7 +148,7 @@ func TestParseAgentToolCallsPayloadVariants(t *testing.T) {
 	}
 	for _, c := range cases {
 		text := "<<<TOOL_CALL>>>" + c.body + "<<<END_TOOL_CALL>>>"
-		calls := ParseAgentToolCalls(text)
+		calls := ParseAgentToolCalls(text, nil)
 		if len(calls) != 1 {
 			t.Errorf("body %s => %d calls, want 1", c.body, len(calls))
 			continue
@@ -162,7 +162,7 @@ func TestParseAgentToolCallsPayloadVariants(t *testing.T) {
 		}
 	}
 	// No recognisable tool name: stays visible text, by policy.
-	if calls := ParseAgentToolCalls(`<<<TOOL_CALL>>>{"command":"ls"}<<<END_TOOL_CALL>>>`); len(calls) != 0 {
+	if calls := ParseAgentToolCalls(`<<<TOOL_CALL>>>{"command":"ls"}<<<END_TOOL_CALL>>>`, nil); len(calls) != 0 {
 		t.Errorf("nameless payload produced %d calls, want 0", len(calls))
 	}
 }
@@ -406,7 +406,7 @@ func TestInterceptorSwallowsFencesAcrossChunks(t *testing.T) {
 
 func TestNonStreamParseStripWithFences(t *testing.T) {
 	text := "Sure!\n```json\n<<<TOOL_CALL>>>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"arch\"}}\n<<<END_TOOL_CALL>>>\n```\nRunning now."
-	calls := ParseAgentToolCalls(text)
+	calls := ParseAgentToolCalls(text, nil)
 	if len(calls) != 1 || calls[0]["function"].(map[string]interface{})["name"] != "bash" {
 		t.Fatalf("parse failed: %#v", calls)
 	}
@@ -1110,7 +1110,7 @@ func TestAgentExtractStripDispatch(t *testing.T) {
 	// The modern tolerant parser resolves the name and folds stray keys into
 	// arguments.
 	withAgentVariant(t, "modern")
-	calls := agentExtractToolCalls(flatPayload)
+	calls := agentExtractToolCalls(flatPayload, nil)
 	if len(calls) != 1 {
 		t.Fatalf("modern extract: %d calls for flat payload, want 1", len(calls))
 	}
@@ -1124,7 +1124,7 @@ func TestAgentExtractStripDispatch(t *testing.T) {
 	withAgentVariant(t, "legacy")
 	// The legacy strict parser accepts the JSON but resolves no name, leaving it
 	// "" — exactly the failure the tolerant parser fixes.
-	legacyCalls := agentExtractToolCalls(flatPayload)
+	legacyCalls := agentExtractToolCalls(flatPayload, nil)
 	for _, tc := range legacyCalls {
 		fn, _ := tc["function"].(map[string]interface{})
 		if name, _ := fn["name"].(string); name != "" {
@@ -1133,7 +1133,7 @@ func TestAgentExtractStripDispatch(t *testing.T) {
 	}
 	// A canonical payload works on legacy as well.
 	canonical := "<<<TOOL_CALL>>>\n{\"name\":\"bash\",\"arguments\":{\"command\":\"id\"}}\n<<<END_TOOL_CALL>>>"
-	if calls := agentExtractToolCalls(canonical); len(calls) != 1 {
+	if calls := agentExtractToolCalls(canonical, nil); len(calls) != 1 {
 		t.Errorf("legacy extract: %d calls for canonical payload, want 1", len(calls))
 	}
 	if got := agentStripToolCalls(canonical); strings.TrimSpace(got) != "" {

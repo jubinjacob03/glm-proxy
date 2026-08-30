@@ -423,6 +423,17 @@ func messagesToPrompt(messages []Message) string {
 	return strings.TrimSpace(sb.String())
 }
 
+// lastUserPromptText returns the most recent user message text, used as
+// signature_prompt so the upstream signs the latest turn, not the whole thread.
+func lastUserPromptText(messages []Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return getMessageContent(messages[i].Content)
+		}
+	}
+	return ""
+}
+
 // URL encoding via lookup table, no per-character allocation: this runs over
 // every captcha parameter on the request path.
 

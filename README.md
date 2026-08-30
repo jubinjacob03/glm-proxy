@@ -1,6 +1,12 @@
-# GLM Bridge — Z.AI Proxy API
+# GLM Bridge — Z.AI Proxy for Trae
 
-An **OpenAI** and **Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z.ai). Drop it in front of any OpenAI- or Anthropic-compatible tool and start using Z.AI's GLM models without browser automation or complex setup at runtime.
+An **OpenAI**- and **Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z.ai), **purpose-built to run Z.AI's GLM models as a native agent inside [Trae](https://trae.ai)** (ByteDance's agentic IDE). It bridges Trae's native OpenAI function-calling to Z.AI's chat backend so GLM behaves like a first-class Trae model — real tool calls, multi-turn memory, and no re-answering of earlier messages — without browser automation or complex runtime setup.
+
+> ### 🎯 Built for Trae
+>
+> This proxy is tuned and tested specifically for **Trae**. Agent mode defaults to a **native, role-preserving** transform: it preserves the `system`/`user`/`assistant`/`tool` conversation Trae sends, and converts GLM's textual tool calls back into the **native OpenAI `tool_calls`** Trae expects (both `<<<TOOL_CALL>>>` and Anthropic-style `<function_calls>` output are recognized). The endpoints remain generic OpenAI/Anthropic, so other clients still work, but Trae is the target.
+>
+> See [Using with Trae](#using-with-trae) for setup.
 
 ---
 
@@ -15,7 +21,7 @@ An **OpenAI** and **Anthropic-compatible** API proxy for [chat.z.ai](https://cha
 - **Automatic token replenishment** — A background monitor watches the device token store and runs the collector when it drops below `TOKEN_MIN`, with exponential backoff on repeated failure
 - **Observability** — Real counters behind `/metrics` (Prometheus text) and `/admin/stats`, plus a `/health` check that reports the device token level rather than just session state
 - **Streaming + non-streaming** — Full SSE support with keep-alive pings every 5 s
-- **Agent mode** — Translates OpenAI tools / function-calling into a text contract that Z.AI can understand, then intercepts `<<<TOOL_CALL>>>` blocks from the model's output and rewrites them back into native `tool_calls` deltas. Ships a **modern** XML-sectioned prompt shim (tolerant marker/fence/payload parsing, history summarization — the default) plus the original **legacy** `[ROLE: ...]` shim as an opt-in.
+- **Agent mode (Trae-native)** — Translates OpenAI tools / function-calling into a text contract Z.AI can understand, then converts the model's tool-call output — both `<<<TOOL_CALL>>>` and Anthropic-style `<function_calls>` — back into native OpenAI `tool_calls` deltas. Defaults to the **native** role-preserving transform (keeps the real `system`/`user`/`assistant`/`tool` conversation so the model answers only the latest turn); a **modern** single-message fold and the original **legacy** `[ROLE: ...]` shim remain as fallbacks.
 - **Per-model feature resolution** — Features resolved per-model from Z.AI server capabilities, with user overrides stored per-model. `image_generation` is **always forced to `false`**.
 - **`reasoning_effort` support** — `high` / `max` values forwarded only when the model's capabilities explicitly allow it; `enable_thinking` is force-enabled when active
 - **Token pool** — Device tokens harvested via the token collector (`cmd/token-collector`) and stored in `tokens.sqlite`. Claimed FIFO and atomically, and only ever spent by the call that actually consumes them, so an upstream hiccup no longer destroys a token (up to 5 attempts per captcha computation, with backoff)
@@ -167,36 +173,40 @@ rebuilding.
 
 ---
 
-## Using it in an agentic IDE (TRAE, Cline, etc.)
+## Using with Trae
 
-The proxy is OpenAI-compatible, so point any tool that accepts a custom OpenAI
-provider at it. For **TRAE**, add a custom model:
+Add GLM as a **custom model** in Trae (Settings → Models → **Add Model** → Custom):
 
-| Setting  | Value                                                                 |
-| -------- | --------------------------------------------------------------------- |
-| Base URL | `http://localhost:3007/v1`                                            |
-| API key  | `Jubin` or `unlimited` (any value in `AUTH_TOKEN`)                    |
-| Model    | `glm-5.3` (set a `ZAI_TOKEN` to unlock it); `glm-4.7` works tokenless |
+| Field              | Value                                                                                                                                                      |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| API Format         | **OpenAI Chat Completions**                                                                                                                                |
+| Custom Request URL | `http://127.0.0.1:3007/v1/chat/completions` with **Full URL ON**, _or_ `http://127.0.0.1:3007/v1` with Full URL **OFF** (Trae appends `/chat/completions`) |
+| API Key            | `Jubin` or `unlimited` (any value in `AUTH_TOKEN`)                                                                                                         |
+| Model ID           | `glm-4.7` (works tokenless) or `glm-5.3` (needs `ZAI_TOKEN`)                                                                                               |
+| Multimodal         | ON only on a vision model (`GLM-5v-Turbo`) with a `ZAI_TOKEN`                                                                                              |
 
-Enable **agent mode** (the installer and Docker default already do) so tools work.
+> ⚠️ **The URL must include the `http://` scheme.** A bare `127.0.0.1:3007` makes Trae fail with `RelativeUrlWithoutBase`. Agent mode is on by default (the installer and Docker set `AGENT_MODE=true`) and is required for tools.
 
 **What works**
 
 - **Streaming chat** and normal completions.
-- **Tool / function calling.** TRAE's tools are translated into a prompt
-  contract and the model's calls are converted back to native `tool_calls`
-  deltas (with `role`, `index`, `id`, `type`, and JSON-string arguments), closed
-  by `finish_reason: tool_calls`. This is what lets TRAE edit files, run
-  commands, and drive its agent loop.
-- **Image attachments**, on a vision-capable model. Attached images are
-  forwarded to Z.AI as standard `image_url` content blocks.
+- **Native tool / function calling.** Trae sends its tools as a standard OpenAI
+  `tools` array and drives a native agent loop (`assistant.tool_calls` + `tool`
+  results). The proxy preserves that conversation, elicits tool calls from GLM,
+  and converts the model's output — whether `<<<TOOL_CALL>>>` or Anthropic-style
+  `<function_calls>` — back into native `tool_calls` deltas (`role`, `index`,
+  `id`, `type`, JSON-string arguments) closed by `finish_reason: tool_calls`.
+  This is what lets Trae edit files, run commands, and drive its agent loop.
+- **Image attachments**, on a vision-capable model, forwarded to Z.AI as
+  standard `image_url` content blocks.
 
 **Honest caveats**
 
-- Tool calling is a **prompt-contract emulation**, not the upstream's native
-  function API (Z.AI's unofficial endpoint has none). It is tolerant and well
-  tested, but a model that ignores the contract can occasionally emit a tool
-  call as plain text. `glm-5.3` and `glm-4.7` follow it reliably.
+- Tool calling is a **prompt-contract bridge**, not the upstream's native
+  function API (Z.AI's unofficial endpoint has none). Both output formats are
+  parsed and it is well tested end-to-end against Trae, but a model that ignores
+  the contract could still emit a call as plain text. `glm-5.3` and `glm-4.7`
+  follow it reliably.
 - **Images require a vision model** (`GLM-5v-Turbo`) **and** a `ZAI_TOKEN`.
   `glm-5.3` is a coding/text flagship, and guest sessions are usually limited to
   `glm-5.3-flash` / `glm-4.7` — attach images on `GLM-5v-Turbo`, or the upstream
@@ -228,8 +238,8 @@ Enable **agent mode** (the installer and Docker default already do) so tools wor
 | `AUTH_TOKEN`              | `Jubin,unlimited` | Accepted API keys for Bearer / `x-api-key` auth; comma-separated to allow several                                                                             |
 | `TIMEOUT`                 | `300000`          | Request timeout in milliseconds                                                                                                                               |
 | `ZAI_TOKEN`               | _(empty)_         | Hardcoded Z.AI JWT — skips guest initialization                                                                                                               |
-| `AGENT_MODE`              | `false`           | Enable agent mode (`1`/`true`/`yes`/`on`/`modern` to enable with the modern shim, `legacy` to enable with the legacy shim)                                    |
-| `AGENT_MODE_VARIANT`      | `modern`          | Agent-mode shim variant override: `modern` or `legacy` (takes precedence over the implicit variant of `AGENT_MODE`)                                           |
+| `AGENT_MODE`              | `false`           | Enable agent mode (`1`/`true`/`yes`/`on` for the default shim, or a variant name `native`/`modern`/`legacy` to enable and pick the shim)                      |
+| `AGENT_MODE_VARIANT`      | `native`          | Agent-mode shim variant: `native` (default, role-preserving), `modern` (folded fallback), or `legacy`                                                         |
 | `LOG_LEVEL`               | `info`            | `debug`, `info`, `warn`, `error`, `off`. `debug` logs every Z.AI request body, response header set, and SSE line, which is expensive on the streaming path    |
 | `LOG_FORMAT`              | `text`            | Log format                                                                                                                                                    |
 | `STREAM_HOLDBACK`         | `24`              | Runes held back at the tail of a live stream so Z.AI `edit_content` tail-backtracks are absorbed before text reaches the client (`0` disables; see issue #23) |
@@ -515,15 +525,19 @@ curl -X POST http://localhost:3007/features \
 
 ## Agent Mode
 
-Z.AI's unofficial `/api/v2/chat/completions` endpoint only accepts messages with `role="user"`. System, assistant, and tool roles cause `INTERNAL_ERROR`. OpenAI-style `tools` / `tool_calls` are also rejected.
+Z.AI's unofficial `/api/v2/chat/completions` endpoint accepts `system`, `user`, and `assistant` roles (confirmed against the live endpoint), but not OpenAI `tools` / `tool_calls` definitions or the `tool` role. It also weights its own system persona over injected system instructions, so a tool contract placed in a _system_ message is ignored — the contract must ride a _user_ message to be honored.
 
-When `AGENT_MODE` is enabled (via `--agent-mode` flag or `AGENT_MODE=true` env), the server translates OpenAI roles & tools into a user-only prompt and converts the model's `<<<TOOL_CALL>>>` blocks back into native `tool_calls` deltas (OpenAI) / `tool_use` content blocks (Anthropic).
+When `AGENT_MODE` is enabled (via `--agent-mode` flag or `AGENT_MODE=true` env), the server translates OpenAI tools into a prompt contract and converts the model's tool-call output — recognizing **both** `<<<TOOL_CALL>>>` blocks **and** Anthropic-style `<function_calls><invoke>` blocks — back into native `tool_calls` deltas (OpenAI) / `tool_use` content blocks (Anthropic). GLM emits either format depending on context; both round-trip to the native `tool_calls` Trae expects.
 
-Two shim implementations are available (select with `--agent-mode-variant` or `AGENT_MODE_VARIANT`):
+Three shim variants are available (select with `--agent-mode-variant` or `AGENT_MODE_VARIANT`):
 
-### Modern shim (default, recommended)
+### Native shim (default)
 
-Implemented in `agent.go`. Instead of rewriting each message, it folds the entire conversation plus the tool contract into **one XML-sectioned prompt** sent as a single user message:
+Implemented in `agent.go`. It preserves the real `system`/`user`/`assistant` conversation so the model answers only the latest turn instead of re-answering the whole history — matching how Trae drives a native agent loop. The tool contract and definitions ride the **latest user turn** (not a system message, which the backend ignores), so tool-calling still works. Assistant `tool_calls` are replayed as `<<<TOOL_CALL>>>` text blocks and `tool` results become tagged user turns. Validated end-to-end against Trae's real request (24 tools, full history) → native `tool_calls` out.
+
+### Modern shim (folded fallback)
+
+Implemented in `agent.go`. Instead of preserving roles, it folds the entire conversation plus the tool contract into **one XML-sectioned prompt** sent as a single user message:
 
 ```
 <system>          — compact output contract (pinned tool-call schema)

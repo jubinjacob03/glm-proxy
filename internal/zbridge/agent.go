@@ -1,16 +1,18 @@
-// Agent mode (modern): an XML-sectioned prompt shim.
+// Agent mode gives Trae real OpenAI tool_calls over a backend with no native
+// function calling.
 //
-// Z.AI's completions endpoint accepts neither non-user roles nor OpenAI tool
-// definitions, so the conversation is folded into one structured prompt and the
-// model's textual tool-call protocol is converted back into OpenAI tool_calls on
-// the way out. No native tool calling is involved.
+// The default NATIVE transform keeps the real system/user/assistant conversation
+// (the /api/v2 endpoint accepts those roles) so the model answers only the latest
+// turn. The tool contract rides the latest USER turn — chat.z.ai ignores tool
+// instructions in a system message. MODERN (AGENT_MODE_VARIANT=modern) folds
+// everything into one user message; LEGACY (=legacy) is the [ROLE: ...] shim.
+// Either way the model's textual tool calls — <<<TOOL_CALL>>> or Anthropic
+// <function_calls> — are converted back into OpenAI tool_calls on the way out.
 //
-// Parsing is deliberately tolerant, because models are sloppy: markers match
-// with 2..4 angle brackets per side, adjacent ```json fences are stripped,
-// several payload shapes are accepted, and the streaming interceptor holds back
-// a trailing window so a marker split across chunks cannot leak as content.
-//
-// The legacy [ROLE: ...] shim is still available via AGENT_MODE_VARIANT=legacy.
+// Parsing is tolerant: markers match 2..4 angle brackets per side, ```json fences
+// are stripped, several payload shapes are accepted, and the streaming
+// interceptor holds back a trailing window so a marker split across chunks never
+// leaks as content.
 
 package zbridge
 
@@ -163,9 +165,21 @@ const agentSystemPrefix = "<system>\n" +
 // agentFinalReminder closes the prompt: models weight the end most heavily, so
 // the contract is the last thing they see.
 const agentFinalReminder = `<output_rules>
+Answer <current_task> only. <recent> and any earlier turns are prior context — do
+not re-answer old messages or re-describe images from earlier turns.
 RESPOND WITH EXACTLY ONE OF:
 1. <<<TOOL_CALL>>>{"name":"<tool_name>","arguments":{...}}<<<END_TOOL_CALL>>> (no fences, no other text)
 2. Plain text final answer (only if no tool applies to this step)
+The tool-call JSON uses EXACTLY the keys "name" and "arguments" — never a "tool" key, never bare top-level parameters.
+</output_rules>`
+
+// agentNativeReminder closes the tool contract that wraps the latest user turn
+// in native mode.
+const agentNativeReminder = `<output_rules>
+Reply to the LAST message only. Earlier turns are context — do not re-answer them or re-describe earlier images.
+Emit EXACTLY ONE of:
+1. <<<TOOL_CALL>>>{"name":"<tool_name>","arguments":{...}}<<<END_TOOL_CALL>>>  (no fences, nothing else)
+2. A plain-text answer (only when no tool applies to this step)
 The tool-call JSON uses EXACTLY the keys "name" and "arguments" — never a "tool" key, never bare top-level parameters.
 </output_rules>`
 
@@ -183,11 +197,12 @@ type agentMessage struct {
 // openAITool is one tools-array entry. Both the nested
 // {type:"function",function:{...}} form and flat definitions are accepted.
 type openAITool struct {
-	Type       string          `json:"type"`
-	Function   *openAIFnSpec   `json:"function,omitempty"`
-	Name       string          `json:"name,omitempty"`
-	Descr      string          `json:"description,omitempty"`
-	Parameters json.RawMessage `json:"parameters,omitempty"`
+	Type        string          `json:"type"`
+	Function    *openAIFnSpec   `json:"function,omitempty"`
+	Name        string          `json:"name,omitempty"`
+	Descr       string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
 }
 
 type openAIFnSpec struct {
@@ -214,7 +229,10 @@ func (t *openAITool) fnParameters() json.RawMessage {
 	if t.Function != nil && len(t.Function.Parameters) > 0 {
 		return t.Function.Parameters
 	}
-	return t.Parameters
+	if len(t.Parameters) > 0 {
+		return t.Parameters
+	}
+	return t.InputSchema
 }
 
 // assistantToolCall is a call inside an incoming assistant message, i.e. the
@@ -567,31 +585,46 @@ func wrapAgentPromptAsMessages(prompt string, images []json.RawMessage) ([]byte,
 // extractImageParts returns every image content part verbatim, in order. The
 // shim folds text and tools into one prompt string, which structurally cannot
 // carry an image, so these are pulled out and re-attached as a content array.
+//
+// Only the LAST user turn's images count. Clients like Trae replay the full
+// history every request, so an image sent earlier is always present; attaching it
+// again made the model answer that stale image when the new turn (say "hi")
+// carried none. Earlier images belong to earlier turns, now context in <recent>.
 func extractImageParts(rawMessages json.RawMessage) []json.RawMessage {
 	var msgs []struct {
+		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	}
 	if json.Unmarshal(rawMessages, &msgs) != nil {
 		return nil
 	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "user" {
+			return imagePartsOfContent(msgs[i].Content)
+		}
+	}
+	return nil
+}
+
+// imagePartsOfContent returns the image_url/input_image parts of one message's
+// content array, in order; string or partless content yields nothing.
+func imagePartsOfContent(content json.RawMessage) []json.RawMessage {
+	trimmed := bytes.TrimSpace(content)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(trimmed, &parts) != nil {
+		return nil
+	}
 	var out []json.RawMessage
-	for _, m := range msgs {
-		trimmed := bytes.TrimSpace(m.Content)
-		if len(trimmed) == 0 || trimmed[0] != '[' {
-			continue // string content or empty: no parts to inspect
+	for _, p := range parts {
+		var probe struct {
+			Type string `json:"type"`
 		}
-		var parts []json.RawMessage
-		if json.Unmarshal(trimmed, &parts) != nil {
-			continue
-		}
-		for _, p := range parts {
-			var probe struct {
-				Type string `json:"type"`
-			}
-			if json.Unmarshal(p, &probe) == nil &&
-				(probe.Type == "image_url" || probe.Type == "input_image") {
-				out = append(out, p)
-			}
+		if json.Unmarshal(p, &probe) == nil &&
+			(probe.Type == "image_url" || probe.Type == "input_image") {
+			out = append(out, p)
 		}
 	}
 	return out
@@ -820,11 +853,16 @@ func agentRandomHex(n int) string {
 }
 
 // ParseAgentToolCalls turns every complete block in finished text into
-// OpenAI-format tool_calls objects.
-func ParseAgentToolCalls(text string) []map[string]interface{} {
+// OpenAI-format tool_calls objects, accepting both the <<<TOOL_CALL>>> markers
+// and Trae's Anthropic-style <function_calls><invoke> blocks.
+func ParseAgentToolCalls(text string, toolsRaw json.RawMessage) []map[string]interface{} {
 	text = NormalizeAgentFences(text)
 	var calls []map[string]interface{}
+	var outside strings.Builder
+	prev := 0
 	for _, span := range findAgentSpans(text) {
+		outside.WriteString(text[prev:span.start])
+		prev = span.end
 		name, args, ok := agentLooseParse(text[span.bodyStart:span.bodyEnd])
 		if !ok || name == "" {
 			continue
@@ -838,10 +876,12 @@ func ParseAgentToolCalls(text string) []map[string]interface{} {
 			},
 		})
 	}
-	return calls
+	outside.WriteString(text[prev:])
+	return append(calls, parseFunctionInvokes(outside.String(), toolsRaw)...)
 }
 
-// StripAgentToolCalls removes every block from finished text.
+// StripAgentToolCalls removes every tool-call block from finished text, in both
+// supported formats.
 func StripAgentToolCalls(text string) string {
 	text = NormalizeAgentFences(text)
 	var kept strings.Builder
@@ -851,7 +891,202 @@ func StripAgentToolCalls(text string) string {
 		prev = span.end
 	}
 	kept.WriteString(text[prev:])
-	return strings.TrimSpace(kept.String())
+	return strings.TrimSpace(stripFunctionCalls(kept.String()))
+}
+
+// Trae drives tools in Anthropic's text format —
+// <function_calls><invoke name="X"><parameter name="p">v</parameter></invoke></function_calls>
+// — and GLM emits it too, so it is parsed into the same OpenAI tool_calls.
+
+const fnCallsOpen = "<function_calls>"
+
+var (
+	fnInvokeRe   = regexp.MustCompile(`(?s)<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>`)
+	fnParamRe    = regexp.MustCompile(`(?s)<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>`)
+	fnCallsTagRe = regexp.MustCompile(`</?function_calls>`)
+)
+
+// fnStartTokens open a Trae tool block; the interceptor holds content back from
+// the earliest of them so a block never leaks as text.
+var fnStartTokens = []string{fnCallsOpen, "<invoke "}
+
+// toolCatalog reads the offered tools once into the set of tool names and the
+// per-tool parameter types. The name set gates <invoke> parsing so a literal
+// invoke block in prose or echoed file content is not mistaken for a call.
+func toolCatalog(toolsRaw json.RawMessage) (names map[string]bool, types map[string]map[string]string) {
+	if len(toolsRaw) == 0 {
+		return nil, nil
+	}
+	var tools []openAITool
+	if json.Unmarshal(toolsRaw, &tools) != nil {
+		return nil, nil
+	}
+	names = make(map[string]bool, len(tools))
+	types = make(map[string]map[string]string, len(tools))
+	for i := range tools {
+		name := tools[i].fnName()
+		if name == "" {
+			continue
+		}
+		names[name] = true
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
+		if json.Unmarshal(tools[i].fnParameters(), &schema) != nil || len(schema.Properties) == 0 {
+			continue
+		}
+		m := make(map[string]string, len(schema.Properties))
+		for pname, praw := range schema.Properties {
+			m[pname] = schemaTypeString(praw)
+		}
+		types[name] = m
+	}
+	return names, types
+}
+
+func schemaTypeString(raw json.RawMessage) string {
+	var probe struct {
+		Type  json.RawMessage   `json:"type"`
+		AnyOf []json.RawMessage `json:"anyOf"`
+		OneOf []json.RawMessage `json:"oneOf"`
+	}
+	if json.Unmarshal(raw, &probe) != nil {
+		return ""
+	}
+	if t := jsonSchemaType(probe.Type); t != "" {
+		return t
+	}
+	for _, alt := range probe.AnyOf {
+		if t := schemaTypeString(alt); t != "" {
+			return t
+		}
+	}
+	for _, alt := range probe.OneOf {
+		if t := schemaTypeString(alt); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// jsonSchemaType resolves a JSON-schema "type" that is either a string or a
+// union array such as ["string","null"] to one non-null type name.
+func jsonSchemaType(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		if s == "null" {
+			return ""
+		}
+		return s
+	}
+	var arr []string
+	if json.Unmarshal(raw, &arr) == nil {
+		for _, t := range arr {
+			if t != "" && t != "null" {
+				return t
+			}
+		}
+	}
+	return ""
+}
+
+// parseFunctionInvokes converts every <invoke> to an OpenAI tool_call, coercing
+// each parameter with the tool's declared JSON-schema type. The schema is built
+// only once an invoke block is actually present, so a tools array is never
+// parsed for a plain-text response.
+func parseFunctionInvokes(text string, toolsRaw json.RawMessage) []map[string]interface{} {
+	invokes := fnInvokeRe.FindAllStringSubmatch(text, -1)
+	if len(invokes) == 0 {
+		return nil
+	}
+	names, schema := toolCatalog(toolsRaw)
+	var calls []map[string]interface{}
+	for _, m := range invokes {
+		name := strings.TrimSpace(m[1])
+		if name == "" {
+			continue
+		}
+		// When the offered tools are known, only their names become calls; a
+		// literal <invoke> in prose or echoed content is left as text.
+		if len(names) > 0 && !names[name] {
+			continue
+		}
+		types := schema[name]
+		args := map[string]json.RawMessage{}
+		for _, p := range fnParamRe.FindAllStringSubmatch(m[2], -1) {
+			pname := strings.TrimSpace(p[1])
+			args[pname] = coerceParamValue(p[2], types[pname])
+		}
+		argsJSON, err := json.Marshal(args)
+		if err != nil {
+			argsJSON = []byte("{}")
+		}
+		calls = append(calls, map[string]interface{}{
+			"id":   "call_" + agentRandomHex(12),
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      name,
+				"arguments": string(argsJSON),
+			},
+		})
+	}
+	return calls
+}
+
+// coerceParamValue converts one XML-extracted parameter to JSON using its schema
+// type: a string stays a JSON string, so braces, digits and newlines survive
+// verbatim; number/integer/boolean/array/object become native JSON when they
+// parse and a string otherwise; an unknown type becomes native JSON only when it
+// clearly opens an array or object.
+func jsonQuote(v string) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage(`""`)
+	}
+	return json.RawMessage(b)
+}
+
+func coerceParamValue(v, typ string) json.RawMessage {
+	switch typ {
+	case "string":
+		return jsonQuote(v)
+	case "number", "integer", "boolean", "array", "object":
+		if t := strings.TrimSpace(v); t != "" {
+			if bt := []byte(t); json.Valid(bt) {
+				return json.RawMessage(bt)
+			}
+		}
+		return jsonQuote(v)
+	default:
+		if t := strings.TrimSpace(v); strings.HasPrefix(t, "[") || strings.HasPrefix(t, "{") {
+			if bt := []byte(t); json.Valid(bt) {
+				return json.RawMessage(bt)
+			}
+		}
+		return jsonQuote(v)
+	}
+}
+
+// stripFunctionCalls removes <function_calls> wrappers and <invoke> blocks.
+func stripFunctionCalls(text string) string {
+	text = fnInvokeRe.ReplaceAllString(text, "")
+	return strings.TrimSpace(fnCallsTagRe.ReplaceAllString(text, ""))
+}
+
+// functionCallsSafeLen returns how many leading bytes of s precede the first
+// Trae tool-block start. A start token split across chunks is caught by the
+// interceptor's trailing keep-window, which is wider than any of them.
+func functionCallsSafeLen(s string) int {
+	safe := len(s)
+	for _, tok := range fnStartTokens {
+		if i := strings.Index(s, tok); i >= 0 && i < safe {
+			safe = i
+		}
+	}
+	return safe
 }
 
 // AgentStreamInterceptor incrementally separates ordinary text from tool-call
@@ -862,6 +1097,7 @@ type AgentStreamInterceptor struct {
 	offset     int
 	callIndex  int
 	pendingSep bool // a tool-call block just closed: watch for a stray fence
+	toolsRaw   json.RawMessage
 }
 
 type AgentParsedChunk struct {
@@ -936,21 +1172,35 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 		start, markerLen := findAgentMarker(rest, agentStartWord, final)
 		if start < 0 {
 			if final {
-				// End of data: the rest is ordinary content.
-				if rest != "" {
+				// End of stream: parse any complete <function_calls> blocks in the
+				// tail into tool_calls and emit the rest — prose, and any
+				// unparseable partial — as content, so nothing is dropped or leaked.
+				if calls := parseFunctionInvokes(rest, in.toolsRaw); len(calls) > 0 {
+					for _, c := range calls {
+						c["index"] = in.callIndex
+						in.callIndex++
+						toolCalls = append(toolCalls, c)
+					}
+					if residual := stripFunctionCalls(rest); residual != "" {
+						content = append(content, residual)
+					}
+				} else if rest != "" {
 					content = append(content, rest)
-					in.offset = len(in.buffer)
 				}
+				in.offset = len(in.buffer)
 				break
 			}
-			// Hold a window wide enough for a fence line plus a partial marker,
-			// so neither leaks while split across chunks. An incomplete marker
-			// keeps its bytes inside this window, so nothing held can belong to a
-			// future match. The cut backs up to a rune boundary; splitting one
-			// would garble as U+FFFD (issue #23).
-			const keep = agentStreamKeep
-			if len(rest) > keep {
-				cut := len(rest) - keep
+			// Not final: hold back any Trae <function_calls> block so it never
+			// leaks as text, keeping a window wide enough for a fence line plus a
+			// partial <<<TOOL_CALL>>> marker split across chunks. The cut backs up
+			// to a rune boundary; splitting one would garble as U+FFFD (issue #23).
+			safe := functionCallsSafeLen(rest)
+			emitLen := len(rest) - agentStreamKeep
+			if safe < emitLen {
+				emitLen = safe
+			}
+			if emitLen > 0 {
+				cut := emitLen
 				for cut > 0 && !utf8.RuneStart(rest[cut]) {
 					cut--
 				}
@@ -964,7 +1214,19 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 		if start > 0 {
 			piece := TrimTrailingAgentFence(rest[:start])
 			if piece != "" {
-				content = append(content, piece)
+				// A <function_calls> block ahead of this marker must not leak as
+				// raw text: parse it into calls and strip the markup first.
+				if strings.Contains(piece, fnCallsOpen) || strings.Contains(piece, "<invoke") {
+					for _, c := range parseFunctionInvokes(piece, in.toolsRaw) {
+						c["index"] = in.callIndex
+						in.callIndex++
+						toolCalls = append(toolCalls, c)
+					}
+					piece = stripFunctionCalls(piece)
+				}
+				if piece != "" {
+					content = append(content, piece)
+				}
 			}
 			in.offset += start
 		}
@@ -1004,6 +1266,147 @@ func isASCIISpace(b byte) bool {
 // different APIs. These adapters present one surface, so the handlers select the
 // active shim purely from config.
 
+// agentNativeCurrentTurnText wraps the latest user turn with the tool contract.
+// It rides the USER turn, not a system message, because chat.z.ai ignores tool
+// instructions placed in a system message. No tools means plain text.
+func agentNativeCurrentTurnText(text string, tools []openAITool) string {
+	if len(tools) == 0 {
+		return text
+	}
+	var b strings.Builder
+	b.WriteString(agentSystemPrefix)
+	b.WriteString("\n\n<tools>\n")
+	b.WriteString(renderAgentTools(tools))
+	b.WriteString("\n</tools>\n\n<current_task>\n")
+	b.WriteString(text)
+	b.WriteString("\n</current_task>\n\n")
+	b.WriteString(agentNativeReminder)
+	return b.String()
+}
+
+// renderAssistantContent is renderAssistantTurn without the <assistant> wrapper:
+// prior text plus any tool_calls re-rendered as <<<TOOL_CALL>>> blocks.
+func renderAssistantContent(m agentMessage) string {
+	text := contentToText(m.Content)
+	if len(m.ToolCalls) == 0 {
+		return text
+	}
+	var blocks []string
+	if text != "" {
+		blocks = append(blocks, text)
+	}
+	for _, call := range m.ToolCalls {
+		if block := renderToolCallBlock(call); block != "" {
+			blocks = append(blocks, block)
+		}
+	}
+	return strings.Join(blocks, "\n")
+}
+
+// agentNativeUserMessage renders a user turn. The current turn carries the tool
+// contract and keeps its images; earlier turns fold to text so a stale image
+// never rides a new turn.
+func agentNativeUserMessage(m agentMessage, isCurrent bool, tools []openAITool) map[string]interface{} {
+	text := contentToText(m.Content)
+	if isCurrent {
+		text = agentNativeCurrentTurnText(text, tools)
+		if imgs := imagePartsOfContent(m.Content); len(imgs) > 0 {
+			content := make([]interface{}, 0, len(imgs)+1)
+			content = append(content, map[string]interface{}{"type": "text", "text": text})
+			for _, img := range imgs {
+				content = append(content, img)
+			}
+			return map[string]interface{}{"role": "user", "content": content}
+		}
+	}
+	return map[string]interface{}{"role": "user", "content": text}
+}
+
+// buildAgentNativeMessages maps the conversation onto the system/user/assistant
+// roles Z.AI accepts: client system stays system; assistant tool_calls render as
+// <<<TOOL_CALL>>> blocks; tool results become <tool_result> user turns; the tool
+// contract rides the latest input turn — the last user turn, or the last tool
+// result in a multi-round loop — so the model always sees the callable tools.
+func buildAgentNativeMessages(msgs []agentMessage, tools []openAITool) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(msgs)+1)
+
+	roles := make([]string, len(msgs))
+	for i := range msgs {
+		roles[i] = strings.ToLower(strings.TrimSpace(msgs[i].Role))
+	}
+
+	var sys strings.Builder
+	for i, m := range msgs {
+		if roles[i] != "system" {
+			continue
+		}
+		if t := contentToText(m.Content); t != "" {
+			if sys.Len() > 0 {
+				sys.WriteString("\n\n")
+			}
+			sys.WriteString(t)
+		}
+	}
+	if sys.Len() > 0 {
+		out = append(out, map[string]interface{}{"role": "system", "content": sys.String()})
+	}
+
+	lastInput := -1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if roles[i] == "user" || roles[i] == "tool" {
+			lastInput = i
+			break
+		}
+	}
+
+	for i, m := range msgs {
+		switch roles[i] {
+		case "system":
+			continue
+		case "assistant":
+			out = append(out, map[string]interface{}{
+				"role":    "assistant",
+				"content": renderAssistantContent(m),
+			})
+		case "tool":
+			content := renderToolResult(m)
+			if i == lastInput {
+				content = agentNativeCurrentTurnText(content, tools)
+			}
+			out = append(out, map[string]interface{}{
+				"role":    "user",
+				"content": content,
+			})
+		case "user":
+			out = append(out, agentNativeUserMessage(m, i == lastInput, tools))
+		default:
+			out = append(out, map[string]interface{}{
+				"role":    "user",
+				"content": contentToText(m.Content),
+			})
+		}
+	}
+
+	if len(out) == 0 {
+		out = append(out, map[string]interface{}{"role": "user", "content": ""})
+	}
+	return out
+}
+
+// transformMessagesForAgentNative preserves conversation roles so the model
+// answers only the latest turn.
+func transformMessagesForAgentNative(rawMessages, toolsRaw json.RawMessage) ([]byte, error) {
+	var msgs []agentMessage
+	if err := json.Unmarshal(rawMessages, &msgs); err != nil {
+		return nil, fmt.Errorf("agent transform (native): parse messages: %w", err)
+	}
+	var tools []openAITool
+	if len(toolsRaw) > 0 {
+		_ = json.Unmarshal(toolsRaw, &tools)
+	}
+	return json.Marshal(buildAgentNativeMessages(msgs, tools))
+}
+
 // transformMessagesForAgentModern folds conversation and contract into one
 // sectioned prompt, wrapped as a single user message.
 func transformMessagesForAgentModern(rawMessages json.RawMessage, toolsRaw json.RawMessage) ([]byte, error) {
@@ -1022,6 +1425,9 @@ func transformMessagesForAgentModern(rawMessages json.RawMessage, toolsRaw json.
 // agentTransformMessages rewrites the messages array for the active shim.
 func agentTransformMessages(rawMessages, toolsRaw json.RawMessage) ([]byte, error) {
 	if config.agentModern() {
+		if config.agentNative() {
+			return transformMessagesForAgentNative(rawMessages, toolsRaw)
+		}
 		return transformMessagesForAgentModern(rawMessages, toolsRaw)
 	}
 	var tools []interface{}
@@ -1032,9 +1438,9 @@ func agentTransformMessages(rawMessages, toolsRaw json.RawMessage) ([]byte, erro
 }
 
 // agentExtractToolCalls lifts tool calls out of finished assistant text.
-func agentExtractToolCalls(text string) []map[string]interface{} {
+func agentExtractToolCalls(text string, toolsRaw json.RawMessage) []map[string]interface{} {
 	if config.agentModern() {
-		return ParseAgentToolCalls(text)
+		return ParseAgentToolCalls(text, toolsRaw)
 	}
 	return extractAgentToolCalls(text)
 }
@@ -1081,9 +1487,9 @@ func (l *legacyAgentInterceptor) finish() (string, []map[string]interface{}) {
 }
 
 // newAgentInterceptor builds the interceptor for the active shim.
-func newAgentInterceptor() agentInterceptor {
+func newAgentInterceptor(toolsRaw json.RawMessage) agentInterceptor {
 	if config.agentModern() {
-		return &modernAgentInterceptor{in: &AgentStreamInterceptor{}}
+		return &modernAgentInterceptor{in: &AgentStreamInterceptor{toolsRaw: toolsRaw}}
 	}
 	return &legacyAgentInterceptor{in: newAgentStreamInterceptor()}
 }

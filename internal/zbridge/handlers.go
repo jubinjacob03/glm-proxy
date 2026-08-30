@@ -135,6 +135,9 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	prompt := messagesToPrompt(messages)
 
+	// signature_prompt = the last user message of what is actually sent.
+	signaturePrompt := lastUserPromptText(messages)
+
 	upstreamModel := model
 	if len(imageParts) > 0 && !modelSupportsVision(model) {
 		if vm := resolveVisionModel(model); vm != "" {
@@ -152,6 +155,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		ChatID:            chatID,
 		ClientMessagesRaw: transformedMessages,
 		ReasoningEffort:   body.ReasoningEffort,
+		SignaturePrompt:   signaturePrompt,
 	}
 
 	// Both `reasoning: bool` and `thinking: {type: ...}` map onto enable_thinking.
@@ -201,7 +205,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 		var interceptor agentInterceptor
 		if config.AgentMode {
-			interceptor = newAgentInterceptor()
+			interceptor = newAgentInterceptor(body.Tools)
 		}
 		toolCallEmitted := false
 		toolCallSeq := 0
@@ -231,6 +235,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer recoverGoroutine("openai keep-alive")
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -242,6 +247,13 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}()
+		var keepAliveOnce sync.Once
+		stopKeepAlive := func() {
+			keepAliveOnce.Do(func() {
+				close(keepAliveStop)
+				wg.Wait()
+			})
+		}
 
 		errored := false
 		ch, err := sendToZAI(upstreamCtx, prompt, opts)
@@ -249,6 +261,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			logErrorf("[Stream] %s", printableASCII(err.Error()))
 			metrics.requestsFailed.Add(1)
 			access.fail(statusFromError(err.Error()), err.Error())
+			stopKeepAlive()
 			sse.data(formatOpenAIError(err.Error(), "api_error", statusFromError(err.Error())))
 			sse.raw("[DONE]")
 			errored = true
@@ -266,6 +279,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					logErrorf("[Stream] %s", printableASCII(result.Err.Error()))
 					metrics.requestsFailed.Add(1)
 					access.fail(statusFromError(result.Err.Error()), result.Err.Error())
+					stopKeepAlive()
 					sse.data(formatOpenAIError(result.Err.Error(), "api_error", statusFromError(result.Err.Error())))
 					sse.raw("[DONE]")
 					errored = true
@@ -281,7 +295,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					// A deep edit_content rewrite rewound already-forwarded text,
 					// so the interceptor's view is stale; reset it (issue #23).
 					if interceptor != nil {
-						interceptor = newAgentInterceptor()
+						interceptor = newAgentInterceptor(body.Tools)
 					}
 				}
 				if result.FullText != "" {
@@ -321,19 +335,24 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		if !errored {
 			if interceptor != nil {
 				// Drain the tail: trailing text plus any call whose block only
-				// completed at end of stream (the shim's hold-back window).
+				// completed at end of stream. rem is already tool-markup-free;
+				// strip once more so a raw block can never leak if the safety net
+				// below is what parses it, while surrounding prose is preserved.
 				rem, tailCalls := interceptor.finish()
-				if rem != "" && !toolCallEmitted {
-					sse.data(oaContentDelta(model, requestId, rem))
+				if rem != "" {
+					if clean := agentStripToolCalls(rem); clean != "" {
+						sse.data(oaContentDelta(model, requestId, clean))
+					}
 				}
 				for _, tc := range tailCalls {
 					emitToolCallDelta(tc)
 					toolCallEmitted = true
 				}
 
-				// Safety net: re-scan the whole text at stream end.
+				// Safety net: re-scan the whole text so a held block becomes
+				// tool_calls instead of leaking as content.
 				if !toolCallEmitted {
-					fallbackCalls := agentExtractToolCalls(fullContent)
+					fallbackCalls := agentExtractToolCalls(fullContent, body.Tools)
 					if len(fallbackCalls) > 0 {
 						for _, tc := range fallbackCalls {
 							emitToolCallDelta(tc)
@@ -343,6 +362,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
+			stopKeepAlive()
 			if toolCallEmitted {
 				sse.data(oaToolCallsStopChunk(model, requestId))
 			} else {
@@ -351,8 +371,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			sse.raw("[DONE]")
 		}
 
-		close(keepAliveStop)
-		wg.Wait()
+		stopKeepAlive()
 
 	} else {
 		ch, err := sendToZAI(upstreamCtx, prompt, opts)
@@ -396,7 +415,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 		// Agent mode: lift tool-call blocks out of the finished text.
 		if config.AgentMode {
-			if toolCalls := agentExtractToolCalls(fullContent); len(toolCalls) > 0 {
+			if toolCalls := agentExtractToolCalls(fullContent, body.Tools); len(toolCalls) > 0 {
 				writeJSON(w, 200, formatOpenAIToolCallResponse(
 					model, requestId, agentStripToolCalls(fullContent),
 					fullReasoning, prompt, toolCalls))
@@ -470,78 +489,82 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 	// Include-All-Features opts into forwarding every server capability.
 	includeAllHeader := strings.EqualFold(r.Header.Get("Include-All-Features"), "true")
 
-	modelFeatureStatesMu.Lock()
-	state, ok := modelFeatureStates[model]
-	if !ok {
-		state = &ModelFeatureState{
-			IncludeAll: false,
-			Overrides:  make(map[string]interface{}),
-		}
-		modelFeatureStates[model] = state
-	}
+	// Scoped so the lock is always released — even on a panic in
+	// getModelCapabilities — before the session.mu section below.
+	resolved, includeAll, overrides := func() (map[string]interface{}, bool, map[string]interface{}) {
+		modelFeatureStatesMu.Lock()
+		defer modelFeatureStatesMu.Unlock()
 
-	// Sticky: once set it stays until overwritten.
-	if includeAllHeader {
-		state.IncludeAll = true
-	}
-
-	// Every key but "model" is a feature override; reasoning and thinking are
-	// aliased onto enable_thinking.
-	for k, v := range body {
-		if k == "model" {
-			continue
-		}
-
-		// reasoning: bool maps to enable_thinking.
-		if k == "reasoning" {
-			if b, ok := v.(bool); ok {
-				state.Overrides["enable_thinking"] = b
+		state, ok := modelFeatureStates[model]
+		if !ok {
+			state = &ModelFeatureState{
+				IncludeAll: false,
+				Overrides:  make(map[string]interface{}),
 			}
-			continue
+			modelFeatureStates[model] = state
 		}
 
-		// thinking: bool, or {"type":"enabled"|"disabled"}, same target.
-		if k == "thinking" {
-			if b, ok := v.(bool); ok {
-				state.Overrides["enable_thinking"] = b
+		// Sticky: once set it stays until overwritten.
+		if includeAllHeader {
+			state.IncludeAll = true
+		}
+
+		// Every key but "model" is a feature override; reasoning and thinking are
+		// aliased onto enable_thinking.
+		for k, v := range body {
+			if k == "model" {
 				continue
 			}
-			if m, ok := v.(map[string]interface{}); ok {
-				if t, ok := m["type"].(string); ok {
-					state.Overrides["enable_thinking"] = (t == "enabled")
+
+			// reasoning: bool maps to enable_thinking.
+			if k == "reasoning" {
+				if b, ok := v.(bool); ok {
+					state.Overrides["enable_thinking"] = b
 				}
 				continue
 			}
-			continue
+
+			// thinking: bool, or {"type":"enabled"|"disabled"}, same target.
+			if k == "thinking" {
+				if b, ok := v.(bool); ok {
+					state.Overrides["enable_thinking"] = b
+					continue
+				}
+				if m, ok := v.(map[string]interface{}); ok {
+					if t, ok := m["type"].(string); ok {
+						state.Overrides["enable_thinking"] = (t == "enabled")
+					}
+					continue
+				}
+				continue
+			}
+
+			// Everything else: camelCase to snake_case, no alias mapping.
+			snakeKey := normalizeFeatureKey(k)
+			// Always forced false on this endpoint.
+			if snakeKey == "image_generation" {
+				continue
+			}
+			// Not accepted; use enable_thinking, reasoning or thinking.
+			if snakeKey == "think" {
+				continue
+			}
+			// Per-request only, validated against model capabilities, so it is never
+			// stored as a persistent override.
+			if snakeKey == "reasoning_effort" {
+				continue
+			}
+			state.Overrides[snakeKey] = v
 		}
 
-		// Everything else: camelCase to snake_case, no alias mapping.
-		snakeKey := normalizeFeatureKey(k)
-		// Always forced false on this endpoint.
-		if snakeKey == "image_generation" {
-			continue
+		// Resolve what the response will report.
+		resolved := resolveFeaturesWithState(getModelCapabilities(model), state)
+		overrides := make(map[string]interface{})
+		for k, v := range state.Overrides {
+			overrides[k] = v
 		}
-		// Not accepted; use enable_thinking, reasoning or thinking.
-		if snakeKey == "think" {
-			continue
-		}
-		// Per-request only, validated against model capabilities, so it is never
-		// stored as a persistent override.
-		if snakeKey == "reasoning_effort" {
-			continue
-		}
-		state.Overrides[snakeKey] = v
-	}
-
-	// Resolve what the response will report.
-	caps := getModelCapabilities(model)
-	resolved := resolveFeaturesWithState(caps, state)
-	includeAll := state.IncludeAll
-	overrides := make(map[string]interface{})
-	for k, v := range state.Overrides {
-		overrides[k] = v
-	}
-	modelFeatureStatesMu.Unlock()
+		return resolved, state.IncludeAll, overrides
+	}()
 
 	// Kept in sync for the dashboard's benefit.
 	session.mu.Lock()
