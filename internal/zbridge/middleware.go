@@ -79,31 +79,41 @@ func dashboardHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func statusHandler(w http.ResponseWriter, r *http.Request) {
+	authenticated := checkAuth(r)
+
 	session.mu.Lock()
-	defer session.mu.Unlock()
+	initialized := session.Initialized
+	var userID, userName, feVersion string
+	var features Features
+	if authenticated {
+		userID = session.UserID
+		userName = session.UserName
+		feVersion = session.FeVersion
+		features = session.Features
+	}
+	session.mu.Unlock()
 
 	body := map[string]interface{}{
-		"connected":   session.Initialized,
+		"connected":   initialized,
 		"mode":        "direct",
 		"sessionPool": sessionPoolStatus(),
 	}
 
-	// Identity only for an authenticated caller. This route stays open so probes and
-	// the dashboard work, and on a 0.0.0.0 bind that would otherwise name the Z.AI
-	// account to anyone who can reach the port.
-	if checkAuth(r) {
+	// Identity only for an authenticated caller: this route stays open for probes
+	// and the dashboard, so on a 0.0.0.0 bind it must not name the Z.AI account to
+	// anyone who can reach the port.
+	if authenticated {
 		var userIDPreview interface{}
-		if session.UserID != "" {
-			uid := session.UserID
-			if len(uid) > 8 {
-				uid = uid[:8]
+		if userID != "" {
+			if len(userID) > 8 {
+				userID = userID[:8]
 			}
-			userIDPreview = uid + "..."
+			userIDPreview = userID + "..."
 		}
-		body["userName"] = session.UserName
+		body["userName"] = userName
 		body["userId"] = userIDPreview
-		body["feVersion"] = session.FeVersion
-		body["features"] = session.Features
+		body["feVersion"] = feVersion
+		body["features"] = features
 	}
 
 	writeJSON(w, 200, body)

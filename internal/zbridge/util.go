@@ -332,13 +332,7 @@ func cookiePathMatches(reqPath, cookiePath string) bool {
 	return reqPath[len(cookiePath)] == '/'
 }
 
-func randomUUID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
+func randomUUID() string { return generateUUID() }
 
 func generateID() string {
 	b := make([]byte, 16)
@@ -442,17 +436,22 @@ const hexLower = "0123456789abcdef"
 
 var baseSafeTable [256]bool
 
-func urlEncode(s string, safe string) string {
-	safeTable := baseSafeTable
-	for i := 0; i < len(safe); i++ {
-		safeTable[safe[i]] = true
+func urlEncode(s string) string {
+	escaped := 0
+	for i := 0; i < len(s); i++ {
+		if !baseSafeTable[s[i]] {
+			escaped++
+		}
+	}
+	if escaped == 0 {
+		return s
 	}
 
 	var b strings.Builder
-	b.Grow(len(s)*3 + 16)
+	b.Grow(len(s) + escaped*2)
 	for i := 0; i < len(s); i++ {
 		c := s[i]
-		if safeTable[c] {
+		if baseSafeTable[c] {
 			b.WriteByte(c)
 		} else {
 			b.WriteByte('%')
@@ -461,19 +460,6 @@ func urlEncode(s string, safe string) string {
 		}
 	}
 	return b.String()
-}
-
-func fromHex(c byte) byte {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0'
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10
-	default:
-		return 0
-	}
 }
 
 func base64Encode(data []byte) string {

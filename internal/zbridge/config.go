@@ -249,7 +249,6 @@ func loadConfig() *Config {
 			c.AgentMode = true
 			c.AgentModeVariant = "native"
 		case "modern":
-			// Opt in to the folded prompt shim (native is the default).
 			c.AgentMode = true
 			c.AgentModeVariant = "modern"
 		case "legacy":

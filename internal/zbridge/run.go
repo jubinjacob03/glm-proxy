@@ -53,6 +53,31 @@ func NewHandler() http.Handler {
 	return corsMiddleware(mux)
 }
 
+const backgroundDrain = 20 * time.Second
+
+func startBackground(name string, run func()) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer recoverGoroutine(name)
+		run()
+	}()
+	return done
+}
+
+func waitForBackground(workers []<-chan struct{}, limit time.Duration) bool {
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	for _, done := range workers {
+		select {
+		case <-done:
+		case <-timer.C:
+			return false
+		}
+	}
+	return true
+}
+
 // Run serves until a fatal error or a termination signal.
 func Run() {
 	flag.StringVar(&dbPath, "db-path", "tokens.sqlite", "Path to SQLite database")
@@ -121,24 +146,18 @@ func Run() {
 	bgCtx, stopBackground := context.WithCancel(context.Background())
 	defer stopBackground()
 
-	var background sync.WaitGroup
+	background := make([]<-chan struct{}, 0, 3)
 
 	if config.TokenMonitor.Enabled {
-		background.Add(1)
-		go func() {
-			defer background.Done()
-			defer recoverGoroutine("token monitor")
+		background = append(background, startBackground("token monitor", func() {
 			tokenMonitor(bgCtx)
-		}()
+		}))
 	}
 
 	if config.AgentMode {
-		background.Add(1)
-		go func() {
-			defer background.Done()
-			defer recoverGoroutine("captcha cache")
+		background = append(background, startBackground("captcha cache", func() {
 			captchaCache.Run(bgCtx)
-		}()
+		}))
 		logInfof("Agent mode: captcha background cache started")
 		switch {
 		case config.agentNative():
@@ -157,15 +176,14 @@ func Run() {
 
 	// Tracked, so a shutdown inside the first few seconds does not close the log and
 	// the database underneath it.
-	background.Add(1)
-	go func() {
-		defer background.Done()
-		defer recoverGoroutine("session init")
+	background = append(background, startBackground("session init", func() {
 		if err := initializeSession(); err != nil {
 			logConsolef("[Startup] Session init deferred — will retry on first request.")
 		}
-		fetchModelsFromZAI() // warm the model cache
-	}()
+		if bgCtx.Err() == nil {
+			fetchModelsFromZAI()
+		}
+	}))
 
 	// See session_pool.go: either mode runs each request on a throwaway chat
 	// that is deleted upstream once its response is processed.
@@ -217,7 +235,9 @@ func Run() {
 			logErrorf("[Server] %v", err)
 			gRunning.Store(false)
 			stopBackground()
-			background.Wait()
+			if !waitForBackground(background, backgroundDrain) {
+				logWarnf("[Shutdown] background workers exceeded %s", backgroundDrain)
+			}
 			if sessionPool != nil {
 				sessionPool.Shutdown()
 			}
@@ -240,7 +260,9 @@ func Run() {
 		// The cache waits for in-flight handshakes and the monitor kills its
 		// collector child, rather than orphaning a browser.
 		stopBackground()
-		background.Wait()
+		if !waitForBackground(background, backgroundDrain) {
+			logWarnf("[Shutdown] background workers exceeded %s", backgroundDrain)
+		}
 
 		// Checked-out sessions go via their own Release; these are the leftovers.
 		if sessionPool != nil {

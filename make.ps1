@@ -48,8 +48,15 @@ function Invoke-GoBuild {
     param([string]$Output, [string]$Package, [string]$ExtraLd = '')
     Write-Host "  building $([System.IO.Path]::GetFileName($Output))" -ForegroundColor DarkGray
     $ld = ("$ldflags $ExtraLd").Trim()
-    go build -trimpath "-ldflags=$ld" -o $Output $Package
-    if ($LASTEXITCODE) { throw "build failed: $Package" }
+    $previousCgoEnabled = [Environment]::GetEnvironmentVariable('CGO_ENABLED', 'Process')
+    try {
+        [Environment]::SetEnvironmentVariable('CGO_ENABLED', '0', 'Process')
+        go build -trimpath "-ldflags=$ld" -o $Output $Package
+        if ($LASTEXITCODE) { throw "build failed: $Package" }
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable('CGO_ENABLED', $previousCgoEnabled, 'Process')
+    }
 }
 
 # ============================================================================

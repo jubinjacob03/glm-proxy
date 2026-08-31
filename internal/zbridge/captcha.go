@@ -202,12 +202,12 @@ func generateSignature(params map[string]string, secKey string) string {
 		if i > 0 {
 			canonical.WriteByte('&')
 		}
-		canonical.WriteString(urlEncode(k, ""))
+		canonical.WriteString(urlEncode(k))
 		canonical.WriteByte('=')
-		canonical.WriteString(urlEncode(params[k], ""))
+		canonical.WriteString(urlEncode(params[k]))
 	}
 
-	stringToSign := "POST&" + urlEncode("/", "") + "&" + urlEncode(canonical.String(), "")
+	stringToSign := "POST&" + urlEncode("/") + "&" + urlEncode(canonical.String())
 	signingKey := secKey + "&"
 	return base64Encode(hmacSHA1([]byte(signingKey), []byte(stringToSign)))
 }
@@ -225,17 +225,17 @@ func buildQueryString(params map[string]string) string {
 		if i > 0 {
 			b.WriteByte('&')
 		}
-		b.WriteString(urlEncode(k, ""))
+		b.WriteString(urlEncode(k))
 		b.WriteByte('=')
-		b.WriteString(urlEncode(params[k], ""))
+		b.WriteString(urlEncode(params[k]))
 	}
 	return b.String()
 }
 
 // postForm posts a form body and decodes the JSON reply into dst. Decoding off the
 // wire avoids buffering the response and copying it twice.
-func postForm(targetURL, body string, extraHeaders map[string]string, dst interface{}) error {
-	req, err := http.NewRequest("POST", targetURL, strings.NewReader(body))
+func postForm(ctx context.Context, targetURL, body string, extraHeaders map[string]string, dst interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, "POST", targetURL, strings.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -262,7 +262,7 @@ func postForm(targetURL, body string, extraHeaders map[string]string, dst interf
 // then verifyCaptcha to trade it all for a verification parameter.
 
 // initCaptcha opens a handshake and returns its certifyID.
-func initCaptcha() (string, error) {
+func initCaptcha(ctx context.Context) (string, error) {
 	params := map[string]string{
 		"AccessKeyId":      accessKey,
 		"Action":           "InitCaptchaV3",
@@ -281,6 +281,7 @@ func initCaptcha() (string, error) {
 
 	var result InitCaptchaResponse
 	if err := postForm(
+		ctx,
 		"https://no8xfe.captcha-open-southeast.aliyuncs.com/",
 		buildQueryString(params), nil, &result); err != nil {
 		return "", fmt.Errorf("InitCaptchaV3: %w", err)
@@ -301,19 +302,7 @@ var argPermTable = [64]int{
 const argConstant = "4xrihv8zb8tf1mfj"
 
 func generateArg(certifyID string) string {
-	encoded := urlEncode(certifyID, "")
-
-	// Identity for already-decoded strings; kept to mirror the original.
-	o := make([]byte, 0, len(encoded))
-	for i := 0; i < len(encoded); {
-		if encoded[i] == '%' && i+2 < len(encoded) {
-			o = append(o, fromHex(encoded[i+1])<<4|fromHex(encoded[i+2]))
-			i += 3
-		} else {
-			o = append(o, encoded[i])
-			i++
-		}
-	}
+	o := certifyID
 
 	// Key-scheduling: permute the state from the key.
 	r := argPermTable
@@ -330,7 +319,7 @@ func generateArg(certifyID string) string {
 	}
 
 	// Keystream generation, XORed into the output.
-	t := make([]byte, 0, len(o))
+	t := make([]byte, len(o))
 	e, a := 0, 0
 	for idx := 0; idx < len(o); idx++ {
 		a = ((e ^ a) + (r[e] ^ r[a])) & (rlen - 1)
@@ -342,7 +331,7 @@ func generateArg(certifyID string) string {
 		m = m ^ (r[e] + r[a])
 		m = m ^ r[(r[e]+r[a])&(rlen-1)]
 		m = m & 255
-		t = append(t, byte(m))
+		t[idx] = byte(m)
 		e = (e + 1) & (rlen - 1)
 	}
 	return base64Encode(t)
@@ -456,7 +445,7 @@ func zlibCompress(data []byte) []byte {
 
 // verifyCaptcha spends the device token and returns the verification parameter.
 // This is the only call that consumes a token.
-func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
+func verifyCaptcha(ctx context.Context, certifyID, dataValue, deviceToken string) (string, error) {
 	cvpJSON, err := jsonMarshal(CVP{
 		CertifyID:   certifyID,
 		Data:        dataValue,
@@ -484,6 +473,7 @@ func verifyCaptcha(certifyID, dataValue, deviceToken string) (string, error) {
 
 	var respJSON VerifyCaptchaResponse
 	if err := postForm(
+		ctx,
 		"https://no8xfe-verify.captcha-open-southeast.aliyuncs.com/",
 		buildQueryString(params), map[string]string{"Referer": ""}, &respJSON); err != nil {
 		return "", fmt.Errorf("VerifyCaptchaV3: %w", err)
@@ -579,7 +569,7 @@ func computeFinalPayload(ctx context.Context) string {
 			return ""
 		}
 
-		payload, err := tryCompute()
+		payload, err := tryCompute(ctx)
 		switch {
 		case err == nil && payload != "":
 			return payload
@@ -620,8 +610,8 @@ func computeFinalPayload(ctx context.Context) string {
 // late as possible, right before the only call that spends it: claiming first
 // meant every upstream hiccup destroyed a token the collector had to re-earn
 // through a headless browser run.
-func tryCompute() (string, error) {
-	certifyID, err := initCaptcha()
+func tryCompute(ctx context.Context) (string, error) {
+	certifyID, err := initCaptcha(ctx)
 	if err != nil {
 		return "", fmt.Errorf("initCaptcha: %w", err)
 	}
@@ -648,13 +638,15 @@ func tryCompute() (string, error) {
 	fb64 := base64Encode(compressed)
 	finalVal := encrypt([]byte(fb64))
 
-	// The only call that spends the token, so earlier failures cost nothing.
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	deviceToken, ok := claimToken()
 	if !ok {
 		return "", errNoDeviceTokens
 	}
 
-	payload, err := verifyCaptcha(certifyID, finalVal, deviceToken)
+	payload, err := verifyCaptcha(ctx, certifyID, finalVal, deviceToken)
 	if err != nil {
 		return "", fmt.Errorf("verifyCaptcha: %w", err)
 	}

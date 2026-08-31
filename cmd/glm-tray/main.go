@@ -271,6 +271,7 @@ func capDur(d, max time.Duration) time.Duration {
 
 var (
 	sup           *supervisor
+	spl           *splash
 	upd           *updater
 	updCancel     context.CancelFunc
 	mUpdate       *systray.MenuItem
@@ -291,24 +292,35 @@ func main() {
 	}
 	sup = s
 
+	// One window covers the whole launch: the update check, any download and
+	// install, then the wait for the proxy to answer.
+	spl = newSplash(sup.dir)
+
 	// An update staged earlier, or published while this machine was off, is
 	// installed before the proxy starts; the installer then relaunches the tray.
-	if applyUpdateBeforeStart() {
+	if applyUpdateBeforeStart(spl) {
+		// Exiting takes the splash with it, and the relaunched tray shows its own.
 		return
 	}
 
+	spl.set(splashIndeterminate, "Starting GLM Proxy...")
 	initJobObject()
 	go s.run()
+	go func() {
+		waitProxyReady(sup.dir, 20*time.Second)
+		spl.close()
+	}()
 	systray.Run(onReady, onExit)
 }
 
 // applyUpdateBeforeStart reports true when an installer was launched and this
-// process should exit.
-func applyUpdateBeforeStart() bool {
+// process should exit. Update states are reported on the splash.
+func applyUpdateBeforeStart(sp *splash) bool {
 	if !updatable() || !autoUpdateEnabled(filepath.Join(sup.dir, envFileName)) {
 		return false
 	}
 	u := newUpdater(sup.dir, nil)
+	u.onStatus = sp.set
 	return u.applyStartupUpdate(context.Background())
 }
 

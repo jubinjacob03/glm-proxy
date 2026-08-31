@@ -41,10 +41,11 @@ const (
 	updateAssetName    = "GLM-Proxy-Setup.exe"
 	updateChecksumName = "SHA256SUMS.txt"
 
-	updateCheckInterval = 60 * time.Minute
-	updateStartupDelay  = 90 * time.Second
-	updateHTTPTimeout   = 15 * time.Minute
-	updateMaxAssetBytes = 200 << 20
+	updateCheckInterval   = 60 * time.Minute
+	updateStartupDelay    = 90 * time.Second
+	updateHTTPTimeout     = 15 * time.Minute
+	updateChecksumTimeout = 30 * time.Second
+	updateMaxAssetBytes   = 200 << 20
 
 	// All a launch spends deciding whether an update exists. Measured at ~0.4s
 	// in practice, so this is a ceiling for slow links, not a target.
@@ -114,6 +115,17 @@ type updater struct {
 
 	// Runs once per newly staged version, on the poller goroutine.
 	onStaged func(version string)
+
+	// Reports launch progress to the splash. Unset for background polling, which
+	// has no window to draw on.
+	onStatus func(percent int, text string)
+}
+
+// status pushes a line to the splash when one is attached.
+func (u *updater) status(percent int, text string) {
+	if u.onStatus != nil {
+		u.onStatus(percent, text)
+	}
 }
 
 func newUpdater(installDir string, onStaged func(version string)) *updater {
@@ -267,16 +279,16 @@ func (u *updater) pendingInstaller() (*pendingUpdate, string, bool) {
 // applyStartupUpdate runs before the proxy starts. True means an installer was
 // launched, so the caller must exit and let it replace the files and relaunch.
 func (u *updater) applyStartupUpdate(ctx context.Context) bool {
-	// A flag naming the version already installed means the last update worked;
-	// retire it so staging does not linger.
-	if p, _, ok := u.pendingInstaller(); !ok && p != nil {
-		logUpdate("clearing stale update flag for %s (running %s)", p.Version, appVersion)
+	pending, pendingPath, pendingReady := u.pendingInstaller()
+	if !pendingReady && pending != nil {
+		logUpdate("clearing stale update flag for %s (running %s)", pending.Version, appVersion)
 		u.clearPending()
 		u.pruneStaging("")
 		return false
 	}
 
-	if p, path, ok := u.pendingInstaller(); ok {
+	if pendingReady {
+		p, path := pending, pendingPath
 		if p.Attempts >= updateMaxAttempts {
 			logUpdate("update to %s failed %d times; abandoning it", p.Version, p.Attempts)
 			u.clearPending()
@@ -290,25 +302,19 @@ func (u *updater) applyStartupUpdate(ctx context.Context) bool {
 		u.setStaged(p.Version, path)
 		logUpdate("installing flagged update %s before startup (attempt %d)", p.Version, p.Attempts)
 
-		dismiss := showUpdateSplash(p.Version)
+		u.status(splashIndeterminate, "Installing update v"+p.Version+"...")
 		if err := u.applyNow(true); err != nil {
-			dismiss()
 			logUpdate("startup install failed: %v", err)
+			u.status(splashIndeterminate, "Starting GLM Proxy...")
 			return false
 		}
-		// The installer stops this process and the splash goes with it; dismiss
-		// anyway in case the install bails out early.
-		go func() {
-			time.Sleep(20 * time.Second)
-			dismiss()
-		}()
 		return true
 	}
 
-	// Nothing waiting, so ask as cheaply as possible: this is the only thing
-	// between the user and a running proxy. One redirect, no body, hard deadline.
+	decisionCtx, cancelDecision := context.WithTimeout(ctx, updateCheckWindow)
+	defer cancelDecision()
 	started := time.Now()
-	tag, err := u.latestTag(ctx)
+	tag, err := u.latestTag(decisionCtx)
 	if err != nil {
 		logUpdate("version check gave up after %v (%v); starting normally",
 			time.Since(started).Round(time.Millisecond), err)
@@ -323,7 +329,7 @@ func (u *updater) applyStartupUpdate(ctx context.Context) bool {
 	// One exists, so the app stays down until it is installed: the window above
 	// bounded the decision, not this.
 	version := normalizeVersion(tag)
-	rel, err := u.fetchLatest(ctx)
+	rel, err := u.fetchLatest(decisionCtx)
 	if err != nil {
 		logUpdate("update %s found but its details could not be read (%v); starting without it",
 			version, err)
@@ -334,29 +340,26 @@ func (u *updater) applyStartupUpdate(ctx context.Context) bool {
 	}
 	logUpdate("update %s found; holding startup until it is installed", version)
 
-	dismiss := showUpdateSplash(version)
+	u.status(0, "Downloading update v"+version+"...")
 	applyCtx, cancel := context.WithTimeout(ctx, updateApplyBudget)
 	defer cancel()
 
 	if err := u.stageRelease(applyCtx, rel); err != nil {
-		dismiss()
 		logUpdate("update %s could not be prepared (%v); starting without it", version, err)
+		u.status(splashIndeterminate, "Starting GLM Proxy...")
 		return false
 	}
 	if _, _, ok := u.staged(); !ok {
-		dismiss()
+		u.status(splashIndeterminate, "Starting GLM Proxy...")
 		return false
 	}
 	logUpdate("installing freshly downloaded update %s before startup", version)
+	u.status(splashIndeterminate, "Installing update v"+version+"...")
 	if err := u.applyNow(true); err != nil {
-		dismiss()
 		logUpdate("startup install failed: %v", err)
+		u.status(splashIndeterminate, "Starting GLM Proxy...")
 		return false
 	}
-	go func() {
-		time.Sleep(20 * time.Second)
-		dismiss()
-	}()
 	return true
 }
 
@@ -390,12 +393,15 @@ func (u *updater) run(ctx context.Context) {
 // bodiless redirect, and the 11 KB rate-limited JSON is fetched only once a newer
 // version is known to exist.
 func (u *updater) checkOnce(ctx context.Context) error {
-	if tag, err := u.latestTag(ctx); err == nil {
+	decisionCtx, cancel := context.WithTimeout(ctx, updateCheckWindow)
+	if tag, err := u.latestTag(decisionCtx); err == nil {
 		if compareVersions(parseVersion(tag), parseVersion(appVersion)) <= 0 {
+			cancel()
 			return nil
 		}
 	}
-	rel, err := u.fetchLatest(ctx)
+	rel, err := u.fetchLatest(decisionCtx)
+	cancel()
 	if err != nil {
 		return err
 	}
@@ -422,7 +428,6 @@ func (u *updater) latestTag(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 
 	if resp.StatusCode < 300 || resp.StatusCode > 399 {
 		return "", fmt.Errorf("release page returned %d, expected a redirect", resp.StatusCode)
@@ -475,26 +480,30 @@ func (u *updater) stageRelease(ctx context.Context, rel *ghRelease) error {
 	}
 	version := normalizeVersion(rel.TagName)
 
-	if _, path, ok := u.pendingInstaller(); ok {
-		if p, _ := u.readPending(); p != nil && p.Version == version {
-			u.setStaged(version, path)
-			return nil
-		}
+	if pending, path, ok := u.pendingInstaller(); ok && pending.Version == version {
+		u.setStaged(version, path)
+		return nil
 	}
 
 	asset, ok := findAsset(rel.Assets, updateAssetName)
 	if !ok {
 		return fmt.Errorf("release %s has no %s asset", rel.TagName, updateAssetName)
 	}
+	if asset.Size > updateMaxAssetBytes {
+		return fmt.Errorf("release asset is too large: %d bytes exceeds %d", asset.Size, updateMaxAssetBytes)
+	}
+
+	stageCtx, cancel := context.WithTimeout(ctx, updateApplyBudget)
+	defer cancel()
 
 	logUpdate("release %s is newer than %s; downloading %s (%d bytes)",
 		rel.TagName, appVersion, asset.Name, asset.Size)
 
-	wantSum, err := u.expectedChecksum(ctx, rel, asset.Name)
+	wantSum, err := u.expectedChecksum(stageCtx, rel, asset.Name)
 	if err != nil {
 		return err
 	}
-	path, err := u.download(ctx, version, asset, wantSum)
+	path, err := u.download(stageCtx, version, asset, wantSum)
 	if err != nil {
 		return err
 	}
@@ -553,7 +562,9 @@ func (u *updater) expectedChecksum(ctx context.Context, rel *ghRelease, name str
 		return "", fmt.Errorf("release %s has no %s; refusing to install unverified",
 			rel.TagName, updateChecksumName)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sums.URL, nil)
+	checksumCtx, cancel := context.WithTimeout(ctx, updateChecksumTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(checksumCtx, http.MethodGet, sums.URL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -607,7 +618,13 @@ func (u *updater) download(ctx context.Context, version string, asset ghAsset, w
 		return "", err
 	}
 	hasher := sha256.New()
-	written, err := io.Copy(io.MultiWriter(f, hasher), io.LimitReader(resp.Body, updateMaxAssetBytes))
+	writers := []io.Writer{f, hasher}
+	if u.onStatus != nil {
+		writers = append(writers, &progressMeter{
+			total: asset.Size, label: "Downloading update v" + version, report: u.onStatus,
+		})
+	}
+	written, err := io.Copy(io.MultiWriter(writers...), io.LimitReader(resp.Body, updateMaxAssetBytes+1))
 	closeErr := f.Close()
 	if err != nil {
 		os.Remove(part)
@@ -616,6 +633,10 @@ func (u *updater) download(ctx context.Context, version string, asset ghAsset, w
 	if closeErr != nil {
 		os.Remove(part)
 		return "", closeErr
+	}
+	if written > updateMaxAssetBytes {
+		os.Remove(part)
+		return "", fmt.Errorf("asset exceeds %d bytes", updateMaxAssetBytes)
 	}
 	if asset.Size > 0 && written != asset.Size {
 		os.Remove(part)
@@ -638,6 +659,50 @@ func (u *updater) download(ctx context.Context, version string, asset ghAsset, w
 		return "", err
 	}
 	return final, nil
+}
+
+// progressMeter throttles splash updates while always reporting completion.
+type progressMeter struct {
+	total  int64
+	label  string
+	report func(percent int, text string)
+
+	written int64
+	lastAt  time.Time
+	lastPct int
+}
+
+func (m *progressMeter) Write(p []byte) (int, error) {
+	n := len(p)
+	m.written += int64(n)
+	if m.report == nil {
+		return n, nil
+	}
+
+	percent := splashIndeterminate
+	if m.total > 0 {
+		percent = int(m.written * 100 / m.total)
+		if percent > 100 {
+			percent = 100
+		}
+	}
+	done := m.total > 0 && m.written >= m.total
+	now := time.Now()
+	if done && m.lastPct == 100 {
+		return n, nil
+	}
+	if !done && !m.lastAt.IsZero() && now.Sub(m.lastAt) < 200*time.Millisecond {
+		return n, nil
+	}
+	m.lastAt, m.lastPct = now, percent
+
+	text := m.label + "..."
+	if m.total > 0 {
+		displayed := min(m.written, m.total)
+		text = fmt.Sprintf("%s  %d%%  (%s of %s)", m.label, percent, humanMB(displayed), humanMB(m.total))
+	}
+	m.report(percent, text)
+	return n, nil
 }
 
 // pruneStaging deletes staged files other than keep, leaving the flag intact.

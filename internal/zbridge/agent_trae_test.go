@@ -626,7 +626,7 @@ func TestParseFunctionCallsMultiple(t *testing.T) {
 
 func TestStripFunctionCalls(t *testing.T) {
 	text := "before\n<function_calls><invoke name=\"Read\"><parameter name=\"file_path\">x</parameter></invoke></function_calls>\nafter"
-	got := StripAgentToolCalls(text)
+	got := StripAgentToolCalls(text, nil)
 	if strings.Contains(got, "function_calls") || strings.Contains(got, "invoke") {
 		t.Errorf("residual tool markup: %q", got)
 	}
@@ -982,5 +982,231 @@ func TestNativeTransformPreservesConversationMemory(t *testing.T) {
 	lc, _ := last["content"].(string)
 	if !strings.Contains(lc, "fix the above issue") || !strings.Contains(lc, "<current_task>") {
 		t.Errorf("final turn should carry the new instruction plus the tool contract: %s", lc)
+	}
+}
+
+// Captured live from Trae: the model puts the tool name in the opening marker
+// instead of the canonical <<<TOOL_CALL>>>{"name":...}.
+const namedMarkerTools = `[{"type":"function","function":{"name":"TodoWrite","parameters":{"type":"object","properties":{"todos":{"type":"array"},"merge":{"type":"boolean"}}}}}]`
+
+func TestParseNamedMarkerToolCall(t *testing.T) {
+	text := "Now let me create a simple agent todo list: <<<TodoWrite>>>\n" +
+		`{"todos": [{"id": "1", "content": "Identify screen", "status": "completed", "priority": "high"}], "merge": false}` +
+		"<<<END_TOOL_CALL>>>"
+	tools := json.RawMessage(namedMarkerTools)
+
+	calls := ParseAgentToolCalls(text, tools)
+	if len(calls) != 1 {
+		t.Fatalf("named marker produced %d calls, want 1", len(calls))
+	}
+	fn := calls[0]["function"].(map[string]interface{})
+	if fn["name"] != "TodoWrite" {
+		t.Errorf("name=%v want TodoWrite", fn["name"])
+	}
+	var a map[string]interface{}
+	if err := json.Unmarshal([]byte(fn["arguments"].(string)), &a); err != nil {
+		t.Fatalf("arguments not valid JSON: %v", err)
+	}
+	if todos, ok := a["todos"].([]interface{}); !ok || len(todos) != 1 {
+		t.Errorf("todos not carried through: %v", a["todos"])
+	}
+	if a["merge"] != false {
+		t.Errorf("merge=%v want false", a["merge"])
+	}
+	stripped := StripAgentToolCalls(text, tools)
+	if strings.Contains(stripped, "TodoWrite") || strings.Contains(stripped, "TOOL_CALL") || strings.Contains(stripped, "todos") {
+		t.Errorf("marker block leaked into visible text: %q", stripped)
+	}
+	if !strings.Contains(stripped, "todo list") {
+		t.Errorf("surrounding prose lost: %q", stripped)
+	}
+}
+
+func TestParseNamedMarkerLowercaseAndClosingTag(t *testing.T) {
+	text := "<<<todowrite>>>" + `{"todos": [], "merge": true}` + "<<<END_TOOL_CALL>>></todowrite>"
+	tools := json.RawMessage(namedMarkerTools)
+	calls := ParseAgentToolCalls(text, tools)
+	if len(calls) != 1 {
+		t.Fatalf("lowercase named marker produced %d calls, want 1", len(calls))
+	}
+	if fn := calls[0]["function"].(map[string]interface{}); fn["name"] != "TodoWrite" {
+		t.Errorf("name=%v want canonical TodoWrite", fn["name"])
+	}
+	if stripped := StripAgentToolCalls(text, tools); strings.TrimSpace(stripped) != "" {
+		t.Errorf("residue left after strip: %q", stripped)
+	}
+}
+
+func TestNamedMarkerIgnoredWhenNotAnOfferedTool(t *testing.T) {
+	text := "Use <<<SomeRandomThing>>> in your reply.<<<END_TOOL_CALL>>>"
+	tools := json.RawMessage(namedMarkerTools)
+	if calls := ParseAgentToolCalls(text, tools); len(calls) != 0 {
+		t.Errorf("bracketed non-tool word became %d calls, want 0", len(calls))
+	}
+}
+
+func TestNamedMarkerNestedCanonicalPayload(t *testing.T) {
+	text := "<<<TodoWrite>>>" + `{"name":"TodoWrite","arguments":{"merge":true}}` + "<<<END_TOOL_CALL>>>"
+	calls := ParseAgentToolCalls(text, json.RawMessage(namedMarkerTools))
+	if len(calls) != 1 {
+		t.Fatalf("want 1 call, got %d", len(calls))
+	}
+	fn := calls[0]["function"].(map[string]interface{})
+	var a map[string]interface{}
+	_ = json.Unmarshal([]byte(fn["arguments"].(string)), &a)
+	if a["merge"] != true || len(a) != 1 {
+		t.Errorf("nested canonical payload not unwrapped: %v", a)
+	}
+}
+
+func TestInterceptorStreamsNamedMarker(t *testing.T) {
+	full := "Creating the list. <<<TodoWrite>>>" +
+		`{"todos": [{"id": "1", "content": "x", "status": "pending"}], "merge": false}` +
+		"<<<END_TOOL_CALL>>></TodoWrite> Done."
+	in := &AgentStreamInterceptor{toolsRaw: json.RawMessage(namedMarkerTools)}
+	var content strings.Builder
+	var toolCalls []map[string]interface{}
+	for i := 0; i < len(full); i += 3 {
+		end := i + 3
+		if end > len(full) {
+			end = len(full)
+		}
+		p := in.Feed(full[i:end])
+		content.WriteString(p.Content)
+		toolCalls = append(toolCalls, p.ToolCalls...)
+	}
+	f := in.Finish()
+	content.WriteString(f.Content)
+	toolCalls = append(toolCalls, f.ToolCalls...)
+
+	got := content.String()
+	for _, bad := range []string{"TodoWrite", "TOOL_CALL", "todos", "<<<", "</"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("streamed content leaked %q: %q", bad, got)
+		}
+	}
+	if !strings.Contains(got, "Creating the list.") || !strings.Contains(got, "Done.") {
+		t.Errorf("prose around the call lost: %q", got)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("streaming produced %d tool calls, want 1", len(toolCalls))
+	}
+	fn := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "TodoWrite" {
+		t.Errorf("name=%v want TodoWrite", fn["name"])
+	}
+	if !json.Valid([]byte(fn["arguments"].(string))) {
+		t.Errorf("streamed arguments not valid JSON: %s", fn["arguments"])
+	}
+}
+
+// Malformed shapes the model actually produces. Each must yield the call under
+// its canonical name and leave no markup visible; a regression here is a lost or
+// leaked tool call.
+func TestToolCallShapeTolerance(t *testing.T) {
+	tools := json.RawMessage(`[
+	 {"type":"function","function":{"name":"TodoWrite","parameters":{"type":"object","properties":{"todos":{"type":"array"},"merge":{"type":"boolean"}}}}},
+	 {"type":"function","function":{"name":"Write","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"content":{"type":"string"}}}}},
+	 {"type":"function","function":{"name":"LS","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}
+	]`)
+
+	cases := []struct {
+		name     string
+		text     string
+		wantName string
+		wantArg  string
+	}{
+		{"canonical", `<<<TOOL_CALL>>>{"name":"LS","arguments":{"path":"."}}<<<END_TOOL_CALL>>>`, "LS", `"path":"."`},
+		{"name in marker", `<<<TodoWrite>>>{"todos":[],"merge":false}<<<END_TOOL_CALL>>>`, "TodoWrite", `"merge":false`},
+		{"lowercase name in body", `<<<TOOL_CALL>>>{"name":"todowrite","arguments":{"todos":[]}}<<<END_TOOL_CALL>>>`, "TodoWrite", `"todos":[]`},
+		{"spaces in markers", `<<< TOOL_CALL >>>{"name":"LS","arguments":{"path":"."}}<<< END_TOOL_CALL >>>`, "LS", `"path":"."`},
+		{"name after colon", `<<<TOOL_CALL: LS>>>{"path":"."}<<<END_TOOL_CALL>>>`, "LS", `"path":"."`},
+		{"no end marker", `<<<TOOL_CALL>>>{"name":"LS","arguments":{"path":"."}}`, "LS", `"path":"."`},
+		{"xml style closer", `<<<TOOL_CALL>>>{"name":"LS","arguments":{"path":"."}}<<</TOOL_CALL>>>`, "LS", `"path":"."`},
+		{"trailing comma", `<<<TOOL_CALL>>>{"name":"LS","arguments":{"path":".",}}<<<END_TOOL_CALL>>>`, "LS", `"path":"."`},
+		{"raw newline in string", "<<<TOOL_CALL>>>{\"name\":\"Write\",\"arguments\":{\"file_path\":\"a.txt\",\"content\":\"line1\nline2\"}}<<<END_TOOL_CALL>>>", "Write", `line1\nline2`},
+		{"invoke single quotes", `<function_calls><invoke name='LS'><parameter name='path'>.</parameter></invoke></function_calls>`, "LS", `"path":"."`},
+		{"invoke lowercase name", `<function_calls><invoke name="ls"><parameter name="path">.</parameter></invoke></function_calls>`, "LS", `"path":"."`},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			calls := ParseAgentToolCalls(c.text, tools)
+			if len(calls) != 1 {
+				t.Fatalf("got %d calls, want 1", len(calls))
+			}
+			fn := calls[0]["function"].(map[string]interface{})
+			if fn["name"] != c.wantName {
+				t.Errorf("name = %v, want %s", fn["name"], c.wantName)
+			}
+			args, _ := fn["arguments"].(string)
+			if !json.Valid([]byte(args)) {
+				t.Fatalf("arguments not valid JSON: %s", args)
+			}
+			if !strings.Contains(args, c.wantArg) {
+				t.Errorf("arguments = %s, want substring %s", args, c.wantArg)
+			}
+			stripped := StripAgentToolCalls(c.text, tools)
+			for _, bad := range []string{"TOOL_CALL", "<<<", "invoke", "parameter"} {
+				if strings.Contains(stripped, bad) {
+					t.Errorf("visible text leaked %q: %q", bad, stripped)
+				}
+			}
+		})
+	}
+}
+
+// An unparseable block must stay visible: silent loss is worse than raw text.
+func TestUnparseableBlockStaysVisible(t *testing.T) {
+	text := `<<<TOOL_CALL>>>this is not json at all<<<END_TOOL_CALL>>>`
+	if calls := ParseAgentToolCalls(text, nil); len(calls) != 0 {
+		t.Errorf("got %d calls, want 0", len(calls))
+	}
+	if got := StripAgentToolCalls(text, nil); !strings.Contains(got, "not json") {
+		t.Errorf("unparseable block vanished: %q", got)
+	}
+}
+
+func TestStreamingShapeTolerance(t *testing.T) {
+	tools := json.RawMessage(`[{"type":"function","function":{"name":"LS","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}]`)
+	cases := []struct{ name, text string }{
+		{"canonical", `<<<TOOL_CALL>>>{"name":"LS","arguments":{"path":"."}}<<<END_TOOL_CALL>>>`},
+		{"name in marker", `<<<LS>>>{"path":"."}<<<END_TOOL_CALL>>>`},
+		{"lowercase body name", `<<<TOOL_CALL>>>{"name":"ls","arguments":{"path":"."}}<<<END_TOOL_CALL>>>`},
+		{"no end marker", `<<<TOOL_CALL>>>{"name":"LS","arguments":{"path":"."}}`},
+		{"spaces in markers", `<<< TOOL_CALL >>>{"name":"LS","arguments":{"path":"."}}<<< END_TOOL_CALL >>>`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			for _, step := range []int{1, 3, 7, 64} {
+				in := &AgentStreamInterceptor{toolsRaw: tools}
+				var content strings.Builder
+				var got []map[string]interface{}
+				for i := 0; i < len(c.text); i += step {
+					e := i + step
+					if e > len(c.text) {
+						e = len(c.text)
+					}
+					p := in.Feed(c.text[i:e])
+					content.WriteString(p.Content)
+					got = append(got, p.ToolCalls...)
+				}
+				f := in.Finish()
+				content.WriteString(f.Content)
+				got = append(got, f.ToolCalls...)
+
+				if len(got) != 1 {
+					t.Fatalf("step %d: got %d calls, want 1", step, len(got))
+				}
+				if fn := got[0]["function"].(map[string]interface{}); fn["name"] != "LS" {
+					t.Errorf("step %d: name = %v, want LS", step, fn["name"])
+				}
+				for _, bad := range []string{"TOOL_CALL", "<<<", "path"} {
+					if strings.Contains(content.String(), bad) {
+						t.Errorf("step %d: content leaked %q: %q", step, bad, content.String())
+					}
+				}
+			}
+		})
 	}
 }

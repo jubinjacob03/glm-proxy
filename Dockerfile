@@ -9,13 +9,15 @@ WORKDIR /src
 
 # Dependencies first, so a source-only edit does not re-download the module graph.
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
 COPY . .
 
 # CGO stays off: modernc.org/sqlite is pure Go, so the binaries are static.
 ENV CGO_ENABLED=0 GOOS=linux
-RUN go build -trimpath -ldflags="-s -w" -o /out/zai-api . \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath -ldflags="-s -w" -o /out/zai-api . \
  && go build -trimpath -ldflags="-s -w" -o /out/token-collector ./cmd/token-collector
 
 # ============================================================================
@@ -51,9 +53,7 @@ RUN set -eu; \
 
 WORKDIR /app
 
-COPY --from=build /out/zai-api         /app/zai-api
-COPY --from=build /out/token-collector /app/token-collector
-RUN chmod +x /app/zai-api /app/token-collector
+COPY --from=build --chmod=0755 /out/zai-api /out/token-collector /app/
 
 # The CLI above installs the OS packages and the browsers, but it puts the driver
 # in the library's default cache. The collector pins its own driver directory, so
@@ -64,8 +64,7 @@ RUN /app/token-collector --install-browsers \
  && rm -rf /root/.cache/ms-playwright-go
 
 # Config is NOT baked into the image: that would put ZAI_TOKEN and AUTH_TOKEN into
-# a layer anyone who pulls or exports it can read, and .env is gitignored so the
-# COPY also failed the build on a fresh clone. docker-compose passes it with
+# a layer anyone who pulls or exports it can read. docker-compose passes .env with
 # env_file at run time; for a bare `docker run`, use --env-file .env or -e.
 
 # No entrypoint script: the proxy reads its config from the environment, creates
