@@ -37,6 +37,9 @@ const (
 	envFileName  = ".env"
 	consoleLog   = "proxy-console.log"
 
+	// Written when a child exits, so each run is visually separated in Monitor.
+	consoleLogSeparator = "--------------------------------------------------------------"
+
 	// Rotated at this size rather than truncated per start, so an open Monitor
 	// window keeps its place across a proxy restart.
 	consoleLogMaxBytes = 8 << 20
@@ -196,6 +199,9 @@ func (s *supervisor) start() <-chan struct{} {
 	go func() {
 		_ = cmd.Wait() // the one and only Wait for this child
 		if logFile != nil {
+			// Separator, so the next run's output is not mistaken for this one's.
+			fmt.Fprintf(logFile, "\n===== proxy stopped %s =====\n%s\n",
+				time.Now().Format("2006-01-02 15:04:05"), consoleLogSeparator)
 			logFile.Close()
 		}
 		close(exited)
@@ -246,13 +252,17 @@ func (s *supervisor) killChild() {
 	}
 }
 
-// triggerRestart stops the child and lets the loop bring it back.
+// triggerRestart stops the child and lets the loop bring it back. It kills the
+// child itself rather than leaving that to the loop: queueing the signal alone
+// was lost whenever the loop sat in its restart backoff instead of the select,
+// so Change token left the old token running.
 func (s *supervisor) triggerRestart() {
 	s.stopping.Store(true)
 	select {
 	case s.restart <- struct{}{}:
 	default:
 	}
+	s.killChild()
 }
 
 // shutdown stops the child and ends the loop for good.
