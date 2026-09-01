@@ -19,6 +19,7 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"encoding/base64"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -47,10 +48,27 @@ const (
 	DefaultBatch             = 5
 	MaxBatch                 = 9
 	UnsafeMaxBatch           = 25
-	SendWaitMs               = 10000
+	SendWaitMs               = 15000
 	MaxRetries               = 3
 	TokenCollectionTimeoutMs = 90000
 	URL                      = "https://chat.z.ai"
+
+	// Extra grace for window.z_um after SendWaitMs: on a slow link the Aliyun
+	// CDN script has not run by then, which used to surface as a TypeError.
+	TokenProviderWaitMs = 30000
+
+	// Settle before re-navigating: an immediate retry aborts the pending
+	// navigation, which failed every remaining attempt in milliseconds.
+	RetryBackoffMs = 5000
+
+	// Page-interaction waits, deliberately generous: a cold laptop on a slow
+	// link paints the chat UI long after a warm one, and every one of these
+	// expiring early fails the whole batch. The outer TOKEN_COLLECT_TIMEOUT
+	// (15 min) and --deadline still bound a genuinely broken network.
+	ElementWaitMs    = 30000 // model button, textarea, send button, model option
+	MenuWaitMs       = 15000 // model dropdown opening
+	OptionProbeMs    = 4000  // "does this model exist?" probe, tried per candidate
+	BestEffortWaitMs = 10000 // scrolling and menu close, where failure is ignored
 
 	// The button id encodes the selected model (model-selector-glm-4_7-button),
 	// so it is matched by prefix rather than a fixed id.
@@ -1037,32 +1055,88 @@ func selectWorkingModel(page playwright.Page) error {
 	humanPause(150, 400)
 
 	menu := page.Locator("[data-dropdown-menu-content][data-state='open']")
-	if err := menu.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(8000)}); err != nil {
+	if err := menu.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(MenuWaitMs)}); err != nil {
 		return fmt.Errorf("model dropdown did not open: %w", err)
 	}
 
 	option := page.Locator("button[data-value]").First()
 	for _, v := range preferredModelValues {
 		cand := page.Locator(fmt.Sprintf("button[data-value=%q]", v))
-		if err := cand.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(1500)}); err == nil {
+		if err := cand.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(OptionProbeMs)}); err == nil {
 			option = cand
 			break
 		}
 	}
-	if err := option.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(3000)}); err != nil {
+	if err := option.WaitFor(playwright.LocatorWaitForOptions{Timeout: playwright.Float(ElementWaitMs)}); err != nil {
 		return fmt.Errorf("no model option available: %w", err)
 	}
 
-	_ = option.ScrollIntoViewIfNeeded(playwright.LocatorScrollIntoViewIfNeededOptions{Timeout: playwright.Float(3000)})
+	_ = option.ScrollIntoViewIfNeeded(playwright.LocatorScrollIntoViewIfNeededOptions{Timeout: playwright.Float(BestEffortWaitMs)})
 	humanPause(100, 250)
 	if err := humanClick(page, option); err != nil {
 		return fmt.Errorf("click model option: %w", err)
 	}
 	_ = menu.WaitFor(playwright.LocatorWaitForOptions{
 		State:   playwright.WaitForSelectorStateHidden,
-		Timeout: playwright.Float(3000),
+		Timeout: playwright.Float(BestEffortWaitMs),
 	})
 	humanPause(200, 500)
+	return nil
+}
+
+// validDeviceToken reports whether a harvested value is really a device token:
+// base64 of region#sessionId#blob#gatherCost#md5. getToken hands back null or a
+// non-string when the captcha bundle only half-initialised, and storing that
+// fails a later captcha with no clue where the bad value came from.
+func validDeviceToken(token string) bool {
+	decoded, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		return false
+	}
+	fields := strings.Split(string(decoded), "#")
+	if len(fields) != 5 {
+		return false
+	}
+	if fields[0] == "" || fields[1] == "" || fields[2] == "" {
+		return false
+	}
+	if len(fields[4]) != 32 {
+		return false
+	}
+	for i := 0; i < len(fields[4]); i++ {
+		if c := fields[4][i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// waitForTokenProvider polls in-page until the Aliyun device-token generator is
+// callable, so a slow CDN costs time instead of the batch. window.um is the
+// fallback name the captcha bundle itself accepts.
+func waitForTokenProvider(page playwright.Page) error {
+	ready, err := page.Evaluate(`async (timeoutMs) => {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            const provider = window.z_um || window.um;
+            if (provider && typeof provider.getToken === 'function') {
+                return true;
+            }
+            if (Date.now() >= deadline) {
+                return false;
+            }
+            await new Promise(r => setTimeout(r, 100));
+        }
+    }`, TokenProviderWaitMs)
+	if err != nil {
+		return fmt.Errorf("waiting for the device-token generator: %w", err)
+	}
+	if ok, _ := ready.(bool); !ok {
+		return fmt.Errorf("the device-token generator (window.z_um) never appeared after %ds: "+
+			"chat.z.ai loads it from g.alicdn.com, so that host is most likely blocked or "+
+			"filtered on this network rather than the token being wrong",
+			(SendWaitMs+TokenProviderWaitMs)/1000)
+	}
 	return nil
 }
 
@@ -1088,13 +1162,13 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 	go func() {
 		defer wg.Done()
 		err1 = page.Locator(ModelSelectorButton).First().WaitFor(
-			playwright.LocatorWaitForOptions{Timeout: playwright.Float(15000)},
+			playwright.LocatorWaitForOptions{Timeout: playwright.Float(ElementWaitMs)},
 		)
 	}()
 	go func() {
 		defer wg.Done()
 		err2 = page.Locator("#chat-input").WaitFor(
-			playwright.LocatorWaitForOptions{Timeout: playwright.Float(15000)},
+			playwright.LocatorWaitForOptions{Timeout: playwright.Float(ElementWaitMs)},
 		)
 	}()
 	wg.Wait()
@@ -1141,7 +1215,7 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 
 	sendBtn := page.Locator("#send-message-button")
 	if err := sendBtn.WaitFor(
-		playwright.LocatorWaitForOptions{Timeout: playwright.Float(5000)},
+		playwright.LocatorWaitForOptions{Timeout: playwright.Float(ElementWaitMs)},
 	); err != nil {
 		return nil, fmt.Errorf("send button not found: %w", err)
 	}
@@ -1153,6 +1227,10 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 
 	logStep("wait", "%dms for the token endpoint to initialise", SendWaitMs)
 	sleep(SendWaitMs)
+
+	if err := waitForTokenProvider(page); err != nil {
+		return nil, err
+	}
 
 	tuiSetStatus(fmt.Sprintf("Collecting %d tokens...", total))
 	logStep("collect", "requesting %d tokens", total)
@@ -1167,9 +1245,13 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 	go func() {
 		val, err := page.Evaluate(`async (args) => {
             const total = args.total;
+            const provider = window.z_um || window.um;
+            if (!provider || typeof provider.getToken !== 'function') {
+                throw new Error('device-token generator disappeared mid-collection');
+            }
             const out = new Array(total);
             for (let i = 0; i < total; i++) {
-                const tok = window.z_um.getToken();
+                const tok = provider.getToken();
                 out[i] = (tok && typeof tok.then === 'function') ? await tok : tok;
                 if (i % 50 === 0) {
                     await new Promise(r => setTimeout(r, 0));
@@ -1191,12 +1273,21 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 		}
 		// Exact capacity, so the append loop never reallocates.
 		tokens := make([]string, 0, len(arr))
+		rejected := 0
 		for _, v := range arr {
-			if s, ok := v.(string); ok {
-				tokens = append(tokens, s)
-			} else if v != nil {
-				tokens = append(tokens, fmt.Sprintf("%v", v))
+			s, isString := v.(string)
+			if !isString || !validDeviceToken(s) {
+				rejected++
+				continue
 			}
+			tokens = append(tokens, s)
+		}
+		if rejected > 0 {
+			logWarn("discarded %d malformed value(s) the page returned instead of a token", rejected)
+		}
+		if len(tokens) == 0 {
+			return nil, fmt.Errorf("the page returned %d value(s), none of them a device token: "+
+				"the captcha bundle loaded but did not initialise", len(arr))
 		}
 		elapsed := time.Since(t0).Seconds()
 		logOK("collected %d tokens in %.2fs", len(tokens), elapsed)
@@ -1276,7 +1367,8 @@ func runBatch(page playwright.Page, total, batchNum int) ([]string, error) {
 				logFail("all %d retries exhausted", MaxRetries)
 				break
 			}
-			logStep("retry", "forcing a page reload")
+			logStep("retry", "settling for %dms, then forcing a page reload", RetryBackoffMs)
+			sleep(RetryBackoffMs)
 			continue
 		}
 		return tokens, nil
@@ -1435,6 +1527,10 @@ var (
 	reCloudAuth = regexp.MustCompile(`^https://cloudauth-device-dualstack\.[^/]*aliyuncs\.com/`)
 	// https://g.alicdn.com/captcha-frontend/FeiLin/*/feilin*.*.js
 	reFeiLin = regexp.MustCompile(`^https://g\.alicdn\.com/captcha-frontend/FeiLin/[^/]+/feilin[^/]*\.[^/]*\.js$`)
+	// https://g.alicdn.com/captcha-frontend/dynamicJS/*/{pe.*.js,main.css}
+	reDynamicJS = regexp.MustCompile(`^https://g\.alicdn\.com/captcha-frontend/dynamicJS/[^/]+/[^/]+\.(js|css)$`)
+	// https://{prefix,prefix-verify,upload}.captcha-open-*.aliyuncs.com/
+	reCaptchaOpen = regexp.MustCompile(`^https://[a-z0-9-]+\.captcha-open-[^./]+\.aliyuncs\.com/`)
 )
 
 // urlAllowed checks a URL against the allowlist. Prefix checks come first (~5 ns)
@@ -1457,6 +1553,12 @@ func urlAllowed(u string) bool {
 	// 5. FeiLin captcha assets: prefix, then regex confirm.
 	case strings.HasPrefix(u, "https://g.alicdn.com/captcha-frontend/FeiLin/"):
 		return reFeiLin.MatchString(u)
+	// 6. dynamicJS: window.z_um never appears without it.
+	case strings.HasPrefix(u, "https://g.alicdn.com/captcha-frontend/dynamicJS/"):
+		return reDynamicJS.MatchString(u)
+	// 7. The init, verify and upload endpoints the handshake calls.
+	case strings.Contains(u, ".captcha-open-"):
+		return reCaptchaOpen.MatchString(u)
 	}
 	return false
 }

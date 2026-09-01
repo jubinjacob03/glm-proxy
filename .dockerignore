@@ -12,6 +12,5 @@ tokens.sqlite
 tokens.sqlite-shm
 tokens.sqlite-wal
 *.sqlite
+.env
 README.md
-
-# .env is NOT ignored: the image bakes it in at build time (see Dockerfile).

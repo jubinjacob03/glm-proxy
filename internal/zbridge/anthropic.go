@@ -679,14 +679,12 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 		}
 	}
 
-	// Drain the interceptor tail: trailing text plus any call whose block only
-	// completed at end of stream. rem is already tool-markup-free; strip once
-	// more so a raw block can never leak if the safety net parses it, while any
-	// surrounding prose is preserved.
+	// Drain the tail, then strip again: a raw block can never leak if the safety
+	// net below is what parses it, and prose is preserved.
 	if interceptor != nil {
 		rem, tailCalls := interceptor.finish()
 		if rem != "" {
-			if clean := agentStripToolCalls(rem); clean != "" {
+			if clean := agentStripToolCalls(rem, opts.ToolsRaw); clean != "" {
 				emitText(clean)
 			}
 		}
@@ -694,8 +692,7 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 			emitToolCallEvent(tc)
 		}
 
-		// Safety net: re-scan the whole text so a held block becomes tool_calls
-		// instead of leaking as content.
+		// Safety net: re-scan the whole text so a held block becomes a call.
 		if !toolCallEmitted {
 			for _, tc := range agentExtractToolCalls(fullContent, opts.ToolsRaw) {
 				emitToolCallEvent(tc)
@@ -779,7 +776,7 @@ func anthropicNonStreamResponse(ctx context.Context, w http.ResponseWriter, prom
 	if config.AgentMode {
 		toolCalls := agentExtractToolCalls(fullContent, opts.ToolsRaw)
 		if len(toolCalls) > 0 {
-			stripped := agentStripToolCalls(fullContent)
+			stripped := agentStripToolCalls(fullContent, opts.ToolsRaw)
 			if stripped != "" {
 				content = append(content, map[string]interface{}{
 					"type": "text",

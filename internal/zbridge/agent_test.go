@@ -84,7 +84,7 @@ func TestParseAgentToolCallsTolerantMarkers(t *testing.T) {
 		if !strings.Contains(args, c.wantArgs) {
 			t.Errorf("arguments = %s, want substring %s", args, c.wantArgs)
 		}
-		if stripped := StripAgentToolCalls(c.text); strings.Contains(stripped, "TOOL_CALL") {
+		if stripped := StripAgentToolCalls(c.text, nil); strings.Contains(stripped, "TOOL_CALL") {
 			t.Errorf("StripAgentToolCalls left markers: %q", stripped)
 		}
 	}
@@ -120,7 +120,7 @@ func TestParseAgentToolCallsFlatPayload(t *testing.T) {
 	if !strings.Contains(args, `"command":"curl -s ifconfig.me"`) || !strings.Contains(args, `"timeout":10`) {
 		t.Errorf("arguments = %s, want flat keys folded into an arguments object", args)
 	}
-	if stripped := StripAgentToolCalls(flatPayload); strings.Contains(stripped, "TOOL_CALL") || strings.TrimSpace(stripped) != "" {
+	if stripped := StripAgentToolCalls(flatPayload, nil); strings.Contains(stripped, "TOOL_CALL") || strings.TrimSpace(stripped) != "" {
 		t.Errorf("StripAgentToolCalls left residue: %q", stripped)
 	}
 }
@@ -410,7 +410,7 @@ func TestNonStreamParseStripWithFences(t *testing.T) {
 	if len(calls) != 1 || calls[0]["function"].(map[string]interface{})["name"] != "bash" {
 		t.Fatalf("parse failed: %#v", calls)
 	}
-	if stripped := StripAgentToolCalls(text); strings.Contains(stripped, "```") || strings.Contains(stripped, "TOOL_CALL") {
+	if stripped := StripAgentToolCalls(text, nil); strings.Contains(stripped, "```") || strings.Contains(stripped, "TOOL_CALL") {
 		t.Errorf("strip left junk: %q", stripped)
 	}
 }
@@ -1117,7 +1117,7 @@ func TestAgentExtractStripDispatch(t *testing.T) {
 	if fn, _ := calls[0]["function"].(map[string]interface{}); fn["name"] != "bash" {
 		t.Errorf("modern extract: name = %v, want bash", fn["name"])
 	}
-	if got := agentStripToolCalls(flatPayload); strings.TrimSpace(got) != "" {
+	if got := agentStripToolCalls(flatPayload, nil); strings.TrimSpace(got) != "" {
 		t.Errorf("modern strip left residue: %q", got)
 	}
 
@@ -1136,7 +1136,7 @@ func TestAgentExtractStripDispatch(t *testing.T) {
 	if calls := agentExtractToolCalls(canonical, nil); len(calls) != 1 {
 		t.Errorf("legacy extract: %d calls for canonical payload, want 1", len(calls))
 	}
-	if got := agentStripToolCalls(canonical); strings.TrimSpace(got) != "" {
+	if got := agentStripToolCalls(canonical, nil); strings.TrimSpace(got) != "" {
 		t.Errorf("legacy strip left residue: %q", got)
 	}
 }

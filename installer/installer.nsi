@@ -16,7 +16,7 @@ SetCompressor /SOLID lzma
 !define APP_NAME    "GLM Proxy"
 !define APP_ID      "GLM-Proxy"
 !define PUBLISHER   "Jubin"
-!define APP_VERSION "2.1.0"
+!define APP_VERSION "2.1.2"
 !define TRAY_EXE    "glm-tray.exe"
 !define UNINST_KEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
 !define RUN_KEY     "Software\Microsoft\Windows\CurrentVersion\Run"
@@ -218,9 +218,8 @@ FunctionEnd
 ; ── Install ───────────────────────────────────────────────────────────────────
 Section "Install"
   ; Stop any running instance so files can be overwritten on upgrade.
-  nsExec::Exec 'taskkill /F /IM ${TRAY_EXE}'
-  nsExec::Exec 'taskkill /F /IM zai-api.exe'
-  nsExec::Exec 'taskkill /F /IM token-collector.exe'
+  nsExec::Exec 'taskkill /F /IM ${TRAY_EXE} /IM zai-api.exe /IM token-collector.exe'
+  Pop $0
 
   SetOutPath "$INSTDIR"
   File "staging\zai-api.exe"
@@ -395,9 +394,8 @@ FunctionEnd
 
 ; ── Uninstall ─────────────────────────────────────────────────────────────────
 Section "Uninstall"
-  nsExec::Exec 'taskkill /F /IM ${TRAY_EXE}'
-  nsExec::Exec 'taskkill /F /IM zai-api.exe'
-  nsExec::Exec 'taskkill /F /IM token-collector.exe'
+  nsExec::Exec 'taskkill /F /IM ${TRAY_EXE} /IM zai-api.exe /IM token-collector.exe'
+  Pop $0
 
   DeleteRegValue HKCU "${RUN_KEY}" "${APP_ID}"
   DeleteRegKey HKCU "${UNINST_KEY}"

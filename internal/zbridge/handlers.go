@@ -334,13 +334,11 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 		if !errored {
 			if interceptor != nil {
-				// Drain the tail: trailing text plus any call whose block only
-				// completed at end of stream. rem is already tool-markup-free;
-				// strip once more so a raw block can never leak if the safety net
-				// below is what parses it, while surrounding prose is preserved.
+				// Drain the tail, then strip again: a raw block can never leak if
+				// the safety net below is what parses it, and prose is preserved.
 				rem, tailCalls := interceptor.finish()
 				if rem != "" {
-					if clean := agentStripToolCalls(rem); clean != "" {
+					if clean := agentStripToolCalls(rem, body.Tools); clean != "" {
 						sse.data(oaContentDelta(model, requestId, clean))
 					}
 				}
@@ -349,8 +347,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					toolCallEmitted = true
 				}
 
-				// Safety net: re-scan the whole text so a held block becomes
-				// tool_calls instead of leaking as content.
+				// Safety net: re-scan the whole text so a held block becomes a call.
 				if !toolCallEmitted {
 					fallbackCalls := agentExtractToolCalls(fullContent, body.Tools)
 					if len(fallbackCalls) > 0 {
@@ -417,7 +414,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		if config.AgentMode {
 			if toolCalls := agentExtractToolCalls(fullContent, body.Tools); len(toolCalls) > 0 {
 				writeJSON(w, 200, formatOpenAIToolCallResponse(
-					model, requestId, agentStripToolCalls(fullContent),
+					model, requestId, agentStripToolCalls(fullContent, body.Tools),
 					fullReasoning, prompt, toolCalls))
 				return
 			}

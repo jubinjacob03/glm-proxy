@@ -74,61 +74,372 @@ const (
 //
 // A '>' run touching the end of s may still grow, so with final=false it reports
 // markerIncomplete rather than matching short and leaking the missing brackets.
-func findAgentMarker(s, word string, final bool) (int, int) {
-	for from := 0; ; {
-		j := strings.Index(s[from:], word)
-		if j < 0 {
-			return markerNone, 0
+func lowerASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+// hasPrefixFoldASCII is strings.HasPrefix with ASCII case folding.
+func hasPrefixFoldASCII(s, prefix string) bool {
+	if len(s) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		if lowerASCII(s[i]) != lowerASCII(prefix[i]) {
+			return false
 		}
-		w := from + j
-		lead := bracketRunBack(s, w, '<')
+	}
+	return true
+}
+
+// agentSkipSpaces counts leading spaces and tabs.
+func agentSkipSpaces(s string) int {
+	n := 0
+	for n < len(s) && (s[n] == ' ' || s[n] == '\t') {
+		n++
+	}
+	return n
+}
+
+// It scans bracket runs rather than searching for word, so matching is linear,
+// allocation-free, and tolerates case and interior spaces alike.
+func findAgentMarker(s, word string, final bool) (int, int) {
+	for i := 0; i < len(s); {
+		j := strings.IndexByte(s[i:], '<')
+		if j < 0 {
+			break
+		}
+		start := i + j
+		lead := bracketRunForward(s[start:], '<')
+		i = start + lead
 		if lead < agentMinBrackets || lead > agentMaxBrackets {
-			from = w + len(word)
 			continue
 		}
-		after := s[w+len(word):]
-		trail := bracketRunForward(after, '>')
+		p := start + lead
+		p += agentSkipSpaces(s[p:])
+		if !hasPrefixFoldASCII(s[p:], word) {
+			// A word still arriving must not be mistaken for absent.
+			if !final && hasPrefixFoldASCII(word, s[p:]) {
+				return markerIncomplete, 0
+			}
+			continue
+		}
+		p += len(word)
+		gap := agentSkipSpaces(s[p:])
+		trail := bracketRunForward(s[p+gap:], '>')
 		switch {
 		case trail > agentMaxBrackets:
 			// Over-long for good: more bytes cannot shrink the run.
-		case trail == len(after) && !final:
-			// Touches the end of the data and may still grow past max, so wait
-			// for a terminating byte.
+		case p+gap+trail == len(s) && !final:
+			// Touches the end and may still grow past max, so wait for a
+			// terminating byte.
 			return markerIncomplete, 0
 		case trail >= agentMinBrackets:
-			return w - lead, lead + len(word) + trail
+			return start, (p + gap + trail) - start
 		}
-		from = w + len(word)
 	}
+	return markerNone, 0
+}
+
+// findAgentEndMarker accepts <<<END_TOOL_CALL>>> and the <<</TOOL_CALL>>> closer
+// models substitute for it.
+func findAgentEndMarker(s string, final bool) (int, int) {
+	e, elen := findAgentMarker(s, agentEndWord, final)
+	a, alen := findAgentMarker(s, "/"+agentStartWord, final)
+	if e >= 0 && (a < 0 || e <= a) {
+		return e, elen
+	}
+	if a >= 0 {
+		return a, alen
+	}
+	return e, elen
+}
+
+// agentIdentByte reports whether b can appear in a tool name inside a marker.
+func agentIdentByte(b byte) bool {
+	return b == '_' || b == '-' || b == '.' ||
+		(b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// findAgentNamedMarker matches an opener carrying the tool name itself —
+// <<<TodoWrite>>> — which models emit regularly. Only offered names match, so
+// bracketed prose is never taken for a call; case folds, canonical is returned.
+func findAgentNamedMarker(s string, names map[string]string) (int, int, string) {
+	if len(names) == 0 {
+		return markerNone, 0, ""
+	}
+	for i := 0; i < len(s); {
+		j := strings.IndexByte(s[i:], '<')
+		if j < 0 {
+			break
+		}
+		start := i + j
+		lead := bracketRunForward(s[start:], '<')
+		i = start + lead
+		if lead < agentMinBrackets || lead > agentMaxBrackets {
+			continue
+		}
+		w := start + lead
+		n := 0
+		for w+n < len(s) && agentIdentByte(s[w+n]) {
+			n++
+		}
+		if n == 0 {
+			continue
+		}
+		word := s[w : w+n]
+		end := w + n
+		canon, ok := names[strings.ToLower(word)]
+		if !ok {
+			// "<<<TOOL_CALL: LS>>>" names the tool after a colon instead.
+			if !strings.EqualFold(word, agentStartWord) {
+				continue
+			}
+			k := end + agentSkipSpaces(s[end:])
+			if k >= len(s) || s[k] != ':' {
+				continue
+			}
+			k++
+			k += agentSkipSpaces(s[k:])
+			m := 0
+			for k+m < len(s) && agentIdentByte(s[k+m]) {
+				m++
+			}
+			if m == 0 {
+				continue
+			}
+			if canon, ok = names[strings.ToLower(s[k:k+m])]; !ok {
+				continue
+			}
+			end = k + m
+		}
+		gap := agentSkipSpaces(s[end:])
+		trail := bracketRunForward(s[end+gap:], '>')
+		if trail >= agentMinBrackets && trail <= agentMaxBrackets {
+			return start, (end + gap + trail) - start, canon
+		}
+	}
+	return markerNone, 0, ""
+}
+
+// agentMarkerSafeLen returns the bytes preceding the earliest position that could
+// still grow into any opener — canonical, name-carrying or colon form — so a
+// marker split across chunks is never emitted as content. Sole hold-back
+// authority for markers, which is why it is deliberately conservative.
+func agentMarkerSafeLen(s string, names map[string]string) int {
+	for i := 0; i < len(s); {
+		j := strings.IndexByte(s[i:], '<')
+		if j < 0 {
+			break
+		}
+		start := i + j
+		lead := bracketRunForward(s[start:], '<')
+		i = start + lead
+		// A bracket run reaching the end may still grow into a marker.
+		if start+lead == len(s) {
+			if lead <= agentMaxBrackets {
+				return start
+			}
+			continue
+		}
+		if lead < agentMinBrackets || lead > agentMaxBrackets {
+			continue
+		}
+		p := start + lead
+		p += agentSkipSpaces(s[p:])
+		if p == len(s) {
+			return start // only spaces so far
+		}
+		n := 0
+		for p+n < len(s) && agentIdentByte(s[p+n]) {
+			n++
+		}
+		if n == 0 {
+			continue
+		}
+		if p+n == len(s) {
+			return start // the word is still arriving
+		}
+		word := s[p : p+n]
+		if _, ok := names[strings.ToLower(word)]; ok {
+			return start
+		}
+		// The canonical word may still grow into "<<<TOOL_CALL: Name>>>".
+		if strings.EqualFold(word, agentStartWord) {
+			return start
+		}
+	}
+	return len(s)
+}
+
+// findAgentStart returns the earliest opener, canonical or name-carrying. An
+// empty name means canonical, whose body names the tool.
+func findAgentStart(s string, names map[string]string, final bool) (int, int, string) {
+	c, clen := findAgentMarker(s, agentStartWord, final)
+	n, nlen, nname := findAgentNamedMarker(s, names)
+	if c >= 0 && (n < 0 || c <= n) {
+		return c, clen, ""
+	}
+	if n >= 0 {
+		return n, nlen, nname
+	}
+	return c, clen, ""
+}
+
+// agentNamedCall treats the body as the named tool's arguments, unless it nests
+// the canonical {"name":...,"arguments":...} shape, which then wins.
+func agentNamedCall(name, body string) (string, json.RawMessage, bool) {
+	raw := strings.TrimSpace(body)
+	raw = agentFenceLead.ReplaceAllString(raw, "")
+	raw = agentFenceTail.ReplaceAllString(raw, "")
+	if raw == "" {
+		return name, json.RawMessage("{}"), true
+	}
+	obj, repaired, ok := agentUnmarshalBody(raw)
+	if !ok {
+		return "", nil, false
+	}
+	raw = repaired
+	hasName, hasArgs := false, false
+	for _, k := range agentNameKeys {
+		if _, ok := obj[k]; ok {
+			hasName = true
+			break
+		}
+	}
+	for _, k := range agentArgKeys {
+		if _, ok := obj[k]; ok {
+			hasArgs = true
+			break
+		}
+	}
+	if hasName && hasArgs {
+		if n, args, ok := agentExtractCall(obj); ok && n != "" {
+			return n, args, true
+		}
+	}
+	return name, json.RawMessage(raw), true
+}
+
+// agentSkipClosingTag returns the length of a stray </toolname> models append
+// after the end marker.
+func agentSkipClosingTag(s string) int {
+	if !strings.HasPrefix(s, "</") {
+		return 0
+	}
+	i := 2
+	for i < len(s) && agentIdentByte(s[i]) {
+		i++
+	}
+	if i == 2 || i >= len(s) || s[i] != '>' {
+		return 0
+	}
+	return i + 1
 }
 
 // agentSpan marks one complete block: [start,end) covers both markers,
-// [bodyStart,bodyEnd) the JSON between them.
+// [bodyStart,bodyEnd) the JSON between them. name is set when the opening marker
+// carried the tool name instead of the canonical word.
 type agentSpan struct {
 	start, bodyStart, bodyEnd, end int
+	name                           string
+	unterminated                   bool
 }
 
-// findAgentSpans walks every complete block; an unterminated opener is ignored.
-func findAgentSpans(text string) []agentSpan {
+// findAgentSpans walks every block in finished text. An opener with no closer
+// still yields a span to the end, so a truncated call is recovered when its
+// payload is complete; callers drop it when the body will not parse.
+func findAgentSpans(text string, names map[string]string) []agentSpan {
 	var spans []agentSpan
 	for pos := 0; ; {
-		s, slen := findAgentMarker(text[pos:], agentStartWord, true)
+		s, slen, name := findAgentStart(text[pos:], names, true)
 		if s < 0 {
 			return spans
 		}
 		bodyStart := pos + s + slen
-		e, elen := findAgentMarker(text[bodyStart:], agentEndWord, true)
+		e, elen := findAgentEndMarker(text[bodyStart:], true)
 		if e < 0 {
-			return spans
+			return append(spans, agentSpan{
+				start:        pos + s,
+				bodyStart:    bodyStart,
+				bodyEnd:      len(text),
+				end:          len(text),
+				name:         name,
+				unterminated: true,
+			})
+		}
+		end := bodyStart + e + elen
+		if adv := agentSkipClosingTag(text[end:]); adv > 0 {
+			end += adv
 		}
 		spans = append(spans, agentSpan{
 			start:     pos + s,
 			bodyStart: bodyStart,
 			bodyEnd:   bodyStart + e,
-			end:       bodyStart + e + elen,
+			end:       end,
+			name:      name,
 		})
-		pos = bodyStart + e + elen
+		pos = end
 	}
+}
+
+// agentSpanCall resolves one span to a call, canonicalizing the tool name.
+func agentSpanCall(span agentSpan, text string, names map[string]string) (string, json.RawMessage, bool) {
+	body := text[span.bodyStart:span.bodyEnd]
+	var name string
+	var args json.RawMessage
+	var ok bool
+	if span.name != "" {
+		name, args, ok = agentNamedCall(span.name, body)
+	} else {
+		name, args, ok = agentLooseParse(body)
+	}
+	return canonicalToolName(name, names), args, ok
+}
+
+// agentSplitToolCalls returns the calls plus the text stripped of exactly the
+// blocks that parsed. One pass drives both, so an unparseable block stays
+// visible instead of being deleted as though it had been handled.
+func agentSplitToolCalls(text string, toolsRaw json.RawMessage) ([]map[string]interface{}, string) {
+	text = NormalizeAgentFences(text)
+	names, _ := toolCatalog(toolsRaw)
+
+	var calls []map[string]interface{}
+	// kept drops parsed blocks only, so an unparseable one stays visible; outside
+	// drops every block, so markup quoted inside one is not re-read as a call.
+	var kept, outside strings.Builder
+	prevKept, prevOutside := 0, 0
+	for _, span := range findAgentSpans(text, names) {
+		name, args, ok := agentSpanCall(span, text, names)
+		if !ok || name == "" {
+			// A stray opener with no closer must not hide the trailing text from
+			// the <invoke> scan; a real block's interior still stays hidden.
+			if !span.unterminated {
+				outside.WriteString(text[prevOutside:span.start])
+				prevOutside = span.end
+			}
+			continue
+		}
+		outside.WriteString(text[prevOutside:span.start])
+		prevOutside = span.end
+		kept.WriteString(text[prevKept:span.start])
+		prevKept = span.end
+		calls = append(calls, map[string]interface{}{
+			"id":   "call_" + agentRandomHex(12),
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      name,
+				"arguments": agentParseArguments(args),
+			},
+		})
+	}
+	outside.WriteString(text[prevOutside:])
+	kept.WriteString(text[prevKept:])
+
+	calls = append(calls, parseFunctionInvokes(outside.String(), toolsRaw)...)
+	return calls, strings.TrimSpace(stripFunctionCalls(kept.String()))
 }
 
 // Prompt section order, exploiting recency bias — the contract appears first and
@@ -160,6 +471,7 @@ const agentSystemPrefix = "<system>\n" +
 	"- Never wrap tool-call markers in code fences.\n" +
 	"- Never invent results. Stop at <<<END_TOOL_CALL>>> and wait for tool output.\n" +
 	"- Never call a tool not listed in <tools>.\n" +
+	"- The opening marker is the literal text <<<TOOL_CALL>>>. Never put the tool name in it (never <<<TodoWrite>>>) and never add a closing tag such as </TodoWrite>.\n" +
 	"</system>"
 
 // agentFinalReminder closes the prompt: models weight the end most heavily, so
@@ -181,6 +493,7 @@ Emit EXACTLY ONE of:
 1. <<<TOOL_CALL>>>{"name":"<tool_name>","arguments":{...}}<<<END_TOOL_CALL>>>  (no fences, nothing else)
 2. A plain-text answer (only when no tool applies to this step)
 The tool-call JSON uses EXACTLY the keys "name" and "arguments" — never a "tool" key, never bare top-level parameters.
+The opening marker is the literal text <<<TOOL_CALL>>>: never put the tool name in it (never <<<TodoWrite>>>), and never append a closing tag such as </TodoWrite>.
 </output_rules>`
 
 // agentMessage is one incoming OpenAI-style message. Content stays raw so both
@@ -785,14 +1098,98 @@ func isJSONNull(raw json.RawMessage) bool {
 	return len(t) == 0 || bytes.Equal(t, []byte("null"))
 }
 
+// agentRepairJSON fixes the deviations models produce in tool-call bodies so the
+// payload parses instead of vanishing: emphasis or backticks around the object,
+// a trailing comma before a closer, and raw newlines or tabs inside strings
+// (illegal JSON, common in file content). Only reached after a strict parse
+// fails, so valid JSON is never touched.
+func agentRepairJSON(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "*`")
+	s = strings.TrimSpace(s)
+
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	inStr, esc := false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			case c == '\n':
+				b.WriteString(`\n`)
+				continue
+			case c == '\r':
+				b.WriteString(`\r`)
+				continue
+			case c == '\t':
+				b.WriteString(`\t`)
+				continue
+			}
+			b.WriteByte(c)
+			continue
+		}
+		if c == '"' {
+			inStr = true
+			b.WriteByte(c)
+			continue
+		}
+		if c == ',' {
+			j := i + 1
+			for j < len(s) && isASCIISpace(s[j]) {
+				j++
+			}
+			if j < len(s) && (s[j] == '}' || s[j] == ']') {
+				continue // a comma that only precedes a closer
+			}
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// agentUnmarshalBody decodes a body, retrying once via agentRepairJSON.
+func agentUnmarshalBody(raw string) (map[string]json.RawMessage, string, bool) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &obj); err == nil && len(obj) > 0 {
+		return obj, raw, true
+	}
+	fixed := agentRepairJSON(raw)
+	if fixed == raw {
+		return nil, raw, false
+	}
+	obj = nil
+	if err := json.Unmarshal([]byte(fixed), &obj); err == nil && len(obj) > 0 {
+		return obj, fixed, true
+	}
+	return nil, raw, false
+}
+
+// canonicalToolName maps the model's spelling onto the exact name from the tools
+// array, so the client recognizes the call.
+func canonicalToolName(name string, names map[string]string) string {
+	if name == "" || len(names) == 0 {
+		return name
+	}
+	if canon, ok := names[strings.ToLower(name)]; ok {
+		return canon
+	}
+	return name
+}
+
 // agentLooseParse parses one body, tolerating fences and the shape deviations
 // listed at agentNameKeys and agentArgKeys.
 func agentLooseParse(body string) (name string, args json.RawMessage, ok bool) {
 	raw := strings.TrimSpace(body)
 	raw = agentFenceLead.ReplaceAllString(raw, "")
 	raw = agentFenceTail.ReplaceAllString(raw, "")
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(raw), &obj); err != nil || len(obj) == 0 {
+	obj, _, ok := agentUnmarshalBody(raw)
+	if !ok {
 		return "", nil, false
 	}
 	return agentExtractCall(obj)
@@ -856,42 +1253,15 @@ func agentRandomHex(n int) string {
 // OpenAI-format tool_calls objects, accepting both the <<<TOOL_CALL>>> markers
 // and Trae's Anthropic-style <function_calls><invoke> blocks.
 func ParseAgentToolCalls(text string, toolsRaw json.RawMessage) []map[string]interface{} {
-	text = NormalizeAgentFences(text)
-	var calls []map[string]interface{}
-	var outside strings.Builder
-	prev := 0
-	for _, span := range findAgentSpans(text) {
-		outside.WriteString(text[prev:span.start])
-		prev = span.end
-		name, args, ok := agentLooseParse(text[span.bodyStart:span.bodyEnd])
-		if !ok || name == "" {
-			continue
-		}
-		calls = append(calls, map[string]interface{}{
-			"id":   "call_" + agentRandomHex(12),
-			"type": "function",
-			"function": map[string]interface{}{
-				"name":      name,
-				"arguments": agentParseArguments(args),
-			},
-		})
-	}
-	outside.WriteString(text[prev:])
-	return append(calls, parseFunctionInvokes(outside.String(), toolsRaw)...)
+	calls, _ := agentSplitToolCalls(text, toolsRaw)
+	return calls
 }
 
 // StripAgentToolCalls removes every tool-call block from finished text, in both
 // supported formats.
-func StripAgentToolCalls(text string) string {
-	text = NormalizeAgentFences(text)
-	var kept strings.Builder
-	prev := 0
-	for _, span := range findAgentSpans(text) {
-		kept.WriteString(text[prev:span.start])
-		prev = span.end
-	}
-	kept.WriteString(text[prev:])
-	return strings.TrimSpace(stripFunctionCalls(kept.String()))
+func StripAgentToolCalls(text string, toolsRaw json.RawMessage) string {
+	_, stripped := agentSplitToolCalls(text, toolsRaw)
+	return stripped
 }
 
 // Trae drives tools in Anthropic's text format —
@@ -901,8 +1271,8 @@ func StripAgentToolCalls(text string) string {
 const fnCallsOpen = "<function_calls>"
 
 var (
-	fnInvokeRe   = regexp.MustCompile(`(?s)<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>`)
-	fnParamRe    = regexp.MustCompile(`(?s)<parameter\s+name="([^"]+)"\s*>(.*?)</parameter>`)
+	fnInvokeRe   = regexp.MustCompile(`(?s)<invoke\s+name=["']([^"']+)["']\s*>(.*?)</invoke>`)
+	fnParamRe    = regexp.MustCompile(`(?s)<parameter\s+name=["']([^"']+)["']\s*>(.*?)</parameter>`)
 	fnCallsTagRe = regexp.MustCompile(`</?function_calls>`)
 )
 
@@ -910,10 +1280,9 @@ var (
 // the earliest of them so a block never leaks as text.
 var fnStartTokens = []string{fnCallsOpen, "<invoke "}
 
-// toolCatalog reads the offered tools once into the set of tool names and the
-// per-tool parameter types. The name set gates <invoke> parsing so a literal
-// invoke block in prose or echoed file content is not mistaken for a call.
-func toolCatalog(toolsRaw json.RawMessage) (names map[string]bool, types map[string]map[string]string) {
+// toolCatalog reads the offered tools once into folded-to-canonical names and
+// per-tool parameter types. The name set gates marker and <invoke> matching.
+func toolCatalog(toolsRaw json.RawMessage) (names map[string]string, types map[string]map[string]string) {
 	if len(toolsRaw) == 0 {
 		return nil, nil
 	}
@@ -921,14 +1290,14 @@ func toolCatalog(toolsRaw json.RawMessage) (names map[string]bool, types map[str
 	if json.Unmarshal(toolsRaw, &tools) != nil {
 		return nil, nil
 	}
-	names = make(map[string]bool, len(tools))
+	names = make(map[string]string, len(tools))
 	types = make(map[string]map[string]string, len(tools))
 	for i := range tools {
 		name := tools[i].fnName()
 		if name == "" {
 			continue
 		}
-		names[name] = true
+		names[strings.ToLower(name)] = name
 		var schema struct {
 			Properties map[string]json.RawMessage `json:"properties"`
 		}
@@ -969,8 +1338,6 @@ func schemaTypeString(raw json.RawMessage) string {
 	return ""
 }
 
-// jsonSchemaType resolves a JSON-schema "type" that is either a string or a
-// union array such as ["string","null"] to one non-null type name.
 func jsonSchemaType(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -993,10 +1360,9 @@ func jsonSchemaType(raw json.RawMessage) string {
 	return ""
 }
 
-// parseFunctionInvokes converts every <invoke> to an OpenAI tool_call, coercing
-// each parameter with the tool's declared JSON-schema type. The schema is built
-// only once an invoke block is actually present, so a tools array is never
-// parsed for a plain-text response.
+// parseFunctionInvokes converts every <invoke> to a tool_call, coercing each
+// parameter by its schema type. The schema is built only once an invoke is
+// present, so a plain-text response never parses the tools array.
 func parseFunctionInvokes(text string, toolsRaw json.RawMessage) []map[string]interface{} {
 	invokes := fnInvokeRe.FindAllStringSubmatch(text, -1)
 	if len(invokes) == 0 {
@@ -1009,10 +1375,12 @@ func parseFunctionInvokes(text string, toolsRaw json.RawMessage) []map[string]in
 		if name == "" {
 			continue
 		}
-		// When the offered tools are known, only their names become calls; a
-		// literal <invoke> in prose or echoed content is left as text.
-		if len(names) > 0 && !names[name] {
-			continue
+		if len(names) > 0 {
+			canon, ok := names[strings.ToLower(name)]
+			if !ok {
+				continue
+			}
+			name = canon
 		}
 		types := schema[name]
 		args := map[string]json.RawMessage{}
@@ -1036,11 +1404,6 @@ func parseFunctionInvokes(text string, toolsRaw json.RawMessage) []map[string]in
 	return calls
 }
 
-// coerceParamValue converts one XML-extracted parameter to JSON using its schema
-// type: a string stays a JSON string, so braces, digits and newlines survive
-// verbatim; number/integer/boolean/array/object become native JSON when they
-// parse and a string otherwise; an unknown type becomes native JSON only when it
-// clearly opens an array or object.
 func jsonQuote(v string) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -1049,6 +1412,10 @@ func jsonQuote(v string) json.RawMessage {
 	return json.RawMessage(b)
 }
 
+// coerceParamValue converts one XML-extracted parameter to JSON by schema type:
+// a string stays quoted, so braces, digits and newlines survive verbatim; a
+// concrete type becomes native JSON when it parses; an unknown type only when it
+// clearly opens an array or object.
 func coerceParamValue(v, typ string) json.RawMessage {
 	switch typ {
 	case "string":
@@ -1098,6 +1465,17 @@ type AgentStreamInterceptor struct {
 	callIndex  int
 	pendingSep bool // a tool-call block just closed: watch for a stray fence
 	toolsRaw   json.RawMessage
+	toolNames  map[string]string
+	catalogSet bool
+}
+
+// names resolves the offered tool names once, not per chunk.
+func (in *AgentStreamInterceptor) names() map[string]string {
+	if !in.catalogSet {
+		in.toolNames, _ = toolCatalog(in.toolsRaw)
+		in.catalogSet = true
+	}
+	return in.toolNames
 }
 
 type AgentParsedChunk struct {
@@ -1162,6 +1540,15 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 				}
 				in.offset += n
 			}
+			if adv := agentSkipClosingTag(in.buffer[in.offset:]); adv > 0 {
+				in.offset += adv
+				continue
+			}
+			// Closing tag still arriving: wait rather than leak "</too".
+			if tail := in.buffer[in.offset:]; !final &&
+				strings.HasPrefix(tail, "</") && !strings.Contains(tail, ">") {
+				break
+			}
 			if agentPossibleFencePrefix(in.buffer[in.offset:]) && !final {
 				break // could still become a fence; wait for more chunks
 			}
@@ -1169,12 +1556,12 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 		}
 
 		rest := in.buffer[in.offset:]
-		start, markerLen := findAgentMarker(rest, agentStartWord, final)
+		names := in.names()
+		start, markerLen, callName := findAgentStart(rest, names, final)
 		if start < 0 {
 			if final {
-				// End of stream: parse any complete <function_calls> blocks in the
-				// tail into tool_calls and emit the rest — prose, and any
-				// unparseable partial — as content, so nothing is dropped or leaked.
+				// End of stream: parse complete <function_calls> in the tail, emit
+				// the rest as content, so nothing is dropped or leaked.
 				if calls := parseFunctionInvokes(rest, in.toolsRaw); len(calls) > 0 {
 					for _, c := range calls {
 						c["index"] = in.callIndex
@@ -1190,11 +1577,13 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 				in.offset = len(in.buffer)
 				break
 			}
-			// Not final: hold back any Trae <function_calls> block so it never
-			// leaks as text, keeping a window wide enough for a fence line plus a
-			// partial <<<TOOL_CALL>>> marker split across chunks. The cut backs up
-			// to a rune boundary; splitting one would garble as U+FFFD (issue #23).
+			// Mid-stream: hold back any partial marker or <function_calls> block so
+			// it never leaks, keeping a window wide enough for a fence line too. The
+			// cut backs up to a rune boundary, else it garbles as U+FFFD (issue #23).
 			safe := functionCallsSafeLen(rest)
+			if n := agentMarkerSafeLen(rest, names); n < safe {
+				safe = n
+			}
 			emitLen := len(rest) - agentStreamKeep
 			if safe < emitLen {
 				emitLen = safe
@@ -1214,8 +1603,8 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 		if start > 0 {
 			piece := TrimTrailingAgentFence(rest[:start])
 			if piece != "" {
-				// A <function_calls> block ahead of this marker must not leak as
-				// raw text: parse it into calls and strip the markup first.
+				// A <function_calls> block ahead of this marker must not leak: parse
+				// it and strip the markup first.
 				if strings.Contains(piece, fnCallsOpen) || strings.Contains(piece, "<invoke") {
 					for _, c := range parseFunctionInvokes(piece, in.toolsRaw) {
 						c["index"] = in.callIndex
@@ -1231,13 +1620,47 @@ func (in *AgentStreamInterceptor) drain(final bool) AgentParsedChunk {
 			in.offset += start
 		}
 		bodyStart := in.offset + markerLen
-		idx, endMarkerLen := findAgentMarker(in.buffer[bodyStart:], agentEndWord, final)
+		idx, endMarkerLen := findAgentEndMarker(in.buffer[bodyStart:], final)
 		if idx < 0 {
-			break // incomplete block: wait for more chunks
+			if !final {
+				break // incomplete block: wait for more chunks
+			}
+			// No closing marker at end of stream: recover the call if the payload is
+			// complete, else show the text rather than drop it.
+			tail := strings.TrimSpace(in.buffer[bodyStart:])
+			name, args, ok := agentLooseParse(tail)
+			if callName != "" {
+				name, args, ok = agentNamedCall(callName, tail)
+			}
+			if name = canonicalToolName(name, names); ok && name != "" {
+				toolCalls = append(toolCalls, map[string]interface{}{
+					"index": in.callIndex,
+					"id":    "call_" + agentRandomHex(12),
+					"type":  "function",
+					"function": map[string]interface{}{
+						"name":      name,
+						"arguments": agentStreamArguments(args),
+					},
+				})
+				in.callIndex++
+			} else {
+				content = append(content, in.buffer[in.offset:])
+			}
+			in.offset = len(in.buffer)
+			break
 		}
 		end := bodyStart + idx
 		raw := strings.TrimSpace(in.buffer[bodyStart:end])
-		if name, args, ok := agentLooseParse(raw); ok && name != "" {
+		var name string
+		var args json.RawMessage
+		var ok bool
+		if callName != "" {
+			name, args, ok = agentNamedCall(callName, raw)
+		} else {
+			name, args, ok = agentLooseParse(raw)
+		}
+		name = canonicalToolName(name, names)
+		if ok && name != "" {
 			toolCalls = append(toolCalls, map[string]interface{}{
 				"index": in.callIndex,
 				"id":    "call_" + agentRandomHex(12),
@@ -1446,9 +1869,9 @@ func agentExtractToolCalls(text string, toolsRaw json.RawMessage) []map[string]i
 }
 
 // agentStripToolCalls removes them, leaving the residual text.
-func agentStripToolCalls(text string) string {
+func agentStripToolCalls(text string, toolsRaw json.RawMessage) string {
 	if config.agentModern() {
-		return StripAgentToolCalls(text)
+		return StripAgentToolCalls(text, toolsRaw)
 	}
 	return stripAgentToolCallBlocks(text)
 }

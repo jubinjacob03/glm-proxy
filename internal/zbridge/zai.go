@@ -1310,7 +1310,7 @@ func streamSSEResponse(ctx context.Context, body io.Reader, ch chan<- ZAIResult)
 		line, readErr := reader.ReadString('\n')
 		if line != "" {
 			trimmed := strings.TrimSpace(line)
-			if trimmed != "" {
+			if trimmed != "" && debugEnabled() {
 				logDebugf("Z.AI SSE line: %s", trimmed)
 			}
 

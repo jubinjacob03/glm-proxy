@@ -16,23 +16,41 @@ import (
 // refresh get the previous list instead of waiting.
 func fetchModelsFromZAI() []ModelInfo {
 	modelsCacheMu.Lock()
-	fresh := len(modelsCache) > 0 && time.Since(modelsCacheTime) < modelsCacheTTL
-	if fresh || modelsRefreshing {
-		stale := modelsCache
+	stale := modelsCache
+	if len(stale) > 0 && time.Since(modelsCacheTime) < modelsCacheTTL {
+		modelsCacheMu.Unlock()
+		return stale
+	}
+	if modelsRefreshing {
 		modelsCacheMu.Unlock()
 		if len(stale) > 0 {
 			return stale
 		}
 		return fallbackModels
 	}
-	// Stamped before the call so a failing upstream is rate-limited by the same TTL
-	// as a success, rather than retried by every request.
+	// Stamped before the fetch so a failing upstream is rate-limited by the same
+	// TTL as a success, rather than retried by every request.
 	modelsRefreshing = true
 	modelsCacheTime = time.Now()
-	stale := modelsCache
 	modelsCacheMu.Unlock()
 
-	fetched := fetchModelsUncached()
+	if len(stale) > 0 {
+		go refreshModelsCache()
+		return stale
+	}
+	return refreshModelsCache()
+}
+
+func refreshModelsCache() []ModelInfo {
+	var fetched []ModelInfo
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				logPanic("model refresh", recovered)
+			}
+		}()
+		fetched = fetchModelsUncached()
+	}()
 
 	modelsCacheMu.Lock()
 	modelsRefreshing = false
@@ -42,15 +60,10 @@ func fetchModelsFromZAI() []ModelInfo {
 	}
 	current := modelsCache
 	modelsCacheMu.Unlock()
-
-	switch {
-	case len(current) > 0:
+	if len(current) > 0 {
 		return current
-	case len(stale) > 0:
-		return stale
-	default:
-		return fallbackModels
 	}
+	return fallbackModels
 }
 
 // fetchModelsUncached does the HTTP work with no lock held, returning nil on failure so

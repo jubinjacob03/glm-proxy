@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -333,70 +332,5 @@ func acquireSingleInstance(name string) bool {
 			return false
 		}
 		time.Sleep(400 * time.Millisecond)
-	}
-}
-
-// showUpdateSplash keeps a small always-on-top window up while an update
-// downloads and installs, so a launch that pauses to update does not look like
-// one that failed. The returned function dismisses it.
-func showUpdateSplash(version string) func() {
-	label := "Installing update"
-	if version != "" {
-		label += " v" + version
-	}
-	label += "..."
-	safe := strings.ReplaceAll(label, "'", "''")
-
-	// The tray exits mid-update, so a parent-PID watchdog plus a hard cap close this
-	// window when the parent goes or after a timeout, never orphaning it on screen.
-	parentPID := os.Getpid()
-
-	script := `Add-Type -AssemblyName System.Windows.Forms; ` +
-		`Add-Type -AssemblyName System.Drawing; ` +
-		`$f = New-Object System.Windows.Forms.Form; ` +
-		`$f.Text = 'GLM Proxy'; ` +
-		`$f.Size = New-Object System.Drawing.Size(380,130); ` +
-		`$f.StartPosition = 'CenterScreen'; ` +
-		`$f.FormBorderStyle = 'FixedDialog'; ` +
-		`$f.ControlBox = $false; ` +
-		`$f.TopMost = $true; ` +
-		`$l = New-Object System.Windows.Forms.Label; ` +
-		`$l.Text = '` + safe + `'; ` +
-		`$l.AutoSize = $false; ` +
-		`$l.Size = New-Object System.Drawing.Size(340,24); ` +
-		`$l.Location = New-Object System.Drawing.Point(20,18); ` +
-		`$p = New-Object System.Windows.Forms.ProgressBar; ` +
-		`$p.Style = 'Marquee'; ` +
-		`$p.MarqueeAnimationSpeed = 30; ` +
-		`$p.Size = New-Object System.Drawing.Size(340,20); ` +
-		`$p.Location = New-Object System.Drawing.Point(20,52); ` +
-		`$f.Controls.Add($l); $f.Controls.Add($p); ` +
-		`$ticks = 0; ` +
-		`$t = New-Object System.Windows.Forms.Timer; ` +
-		`$t.Interval = 1000; ` +
-		`$t.Add_Tick({ ` +
-		`  $script:ticks++; ` +
-		`  $alive = $true; ` +
-		`  try { $null = Get-Process -Id ` + fmt.Sprint(parentPID) + ` -ErrorAction Stop } catch { $alive = $false } ` +
-		`  if (-not $alive -or $script:ticks -ge 180) { $f.Close() } ` +
-		`}); ` +
-		`$t.Start(); ` +
-		`[void]$f.ShowDialog()`
-
-	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
-	// No HideWindow: its SW_HIDE would make the splash form invisible, the same way
-	// it hid the token dialog. createNoWindow still suppresses the PowerShell console.
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow}
-	if err := cmd.Start(); err != nil {
-		return func() {}
-	}
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
-			}
-			_, _ = cmd.Process.Wait()
-		})
 	}
 }
