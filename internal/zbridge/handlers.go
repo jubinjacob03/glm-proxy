@@ -139,12 +139,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	signaturePrompt := lastUserPromptText(messages)
 
 	upstreamModel := model
-	if len(imageParts) > 0 && !modelSupportsVision(model) {
-		if vm := resolveVisionModel(model); vm != "" {
+	if len(imageParts) > 0 {
+		models := fetchModelsFromZAI()
+		if !modelSupportsVisionIn(model, models) {
+			if vm := resolveVisionModelIn(model, models); vm != "" {
 			logConsolef("[Vision] %s cannot accept images; routing this request to %s", printableASCII(model), vm)
 			upstreamModel = vm
-		} else {
-			logErrorf("[Vision] %s cannot accept images and no vision model is available", printableASCII(model))
+			} else {
+				logErrorf("[Vision] %s cannot accept images and no vision model is available", printableASCII(model))
+			}
 		}
 	}
 

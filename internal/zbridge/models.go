@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -135,7 +137,11 @@ func fetchModelsUncached() []ModelInfo {
 
 // getModelCapabilities returns a model's raw capabilities map.
 func getModelCapabilities(modelID string) map[string]interface{} {
-	for _, m := range fetchModelsFromZAI() {
+	return getModelCapabilitiesIn(modelID, fetchModelsFromZAI())
+}
+
+func getModelCapabilitiesIn(modelID string, models []ModelInfo) map[string]interface{} {
+	for _, m := range models {
 		if strings.EqualFold(m.ID, modelID) {
 			return m.Capabilities
 		}
@@ -146,10 +152,15 @@ func getModelCapabilities(modelID string) map[string]interface{} {
 // modelSupportsReasoningEffort needs the capability explicitly true; false and
 // missing both mean unsupported.
 func modelSupportsReasoningEffort(modelID string) bool {
+	return modelSupportsReasoningEffortIn(modelID, fetchModelsFromZAI())
+}
+
+func modelSupportsReasoningEffortIn(modelID string, models []ModelInfo) bool {
+	modelID = canonicalUpstreamModelIDIn(modelID, models)
 	if modelID == "" {
 		return false
 	}
-	caps := getModelCapabilities(modelID)
+	caps := getModelCapabilitiesIn(modelID, models)
 	if caps == nil {
 		return false
 	}
@@ -172,20 +183,191 @@ func capsHaveVision(caps map[string]interface{}) bool {
 
 // modelSupportsVision reports whether Z.AI advertises image input.
 func modelSupportsVision(modelID string) bool {
+	return modelSupportsVisionIn(modelID, fetchModelsFromZAI())
+}
+
+func modelSupportsVisionIn(modelID string, models []ModelInfo) bool {
+	requested := modelID
+	modelID = canonicalUpstreamModelIDIn(modelID, models)
 	if modelID == "" {
 		return false
 	}
-	return capsHaveVision(getModelCapabilities(modelID))
+	if caps := getModelCapabilitiesIn(modelID, models); caps != nil {
+		return capsHaveVision(caps)
+	}
+	return isGLM53FlashAlias(requested) || strings.EqualFold(modelID, "x-preview-l")
+}
+
+func isGLM53FlashAlias(modelID string) bool {
+	return modelAliasKey(modelID) == modelAliasKey("glm-5.3-flash")
+}
+
+func modelAliasKey(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+var modelAliasTokenRe = regexp.MustCompile(`[a-z0-9]+`)
+var modelAliasRegexCache sync.Map
+
+func uniqueLowerTokens(s string) []string {
+	raw := modelAliasTokenRe.FindAllString(strings.ToLower(s), -1)
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, t := range raw {
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
+func compileModelAliasRegex(tokens []string) *regexp.Regexp {
+	if len(tokens) == 0 {
+		return nil
+	}
+	cacheKey := strings.Join(tokens, "|")
+	if cached, ok := modelAliasRegexCache.Load(cacheKey); ok {
+		if re, ok := cached.(*regexp.Regexp); ok {
+			return re
+		}
+	}
+	var b strings.Builder
+	b.WriteString(`(?i)\b(?:`)
+	for i, t := range tokens {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		b.WriteString(regexp.QuoteMeta(t))
+	}
+	b.WriteString(`)\b`)
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return nil
+	}
+	modelAliasRegexCache.Store(cacheKey, re)
+	return re
+}
+
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func resolveModelAlias(modelID string, models []ModelInfo) string {
+	if modelID == "" {
+		return ""
+	}
+	modelsCount := len(models)
+	for _, m := range models {
+		if strings.EqualFold(m.ID, modelID) {
+			return m.ID
+		}
+	}
+	key := modelAliasKey(modelID)
+	if key == "" {
+		return ""
+	}
+	idKeys := make([]string, modelsCount)
+	nameKeys := make([]string, modelsCount)
+	searchFields := make([]string, modelsCount)
+	for i, m := range models {
+		idKeys[i] = modelAliasKey(m.ID)
+		nameKeys[i] = modelAliasKey(m.Name)
+		searchFields[i] = strings.ToLower(strings.TrimSpace(m.ID + " " + m.Name))
+	}
+	for i, m := range models {
+		if idKeys[i] == key || nameKeys[i] == key {
+			return m.ID
+		}
+	}
+	tokens := uniqueLowerTokens(modelID)
+	re := compileModelAliasRegex(tokens)
+	if re == nil {
+		return ""
+	}
+	bestID := ""
+	bestMatches := 0
+	bestDistance := 0
+	for i, m := range models {
+		candidate := searchFields[i]
+		hits := re.FindAllString(candidate, -1)
+		if len(hits) == 0 {
+			continue
+		}
+		matchCount := 0
+		for hi := 0; hi < len(hits); hi++ {
+			dup := false
+			for hj := 0; hj < hi; hj++ {
+				if strings.EqualFold(hits[hi], hits[hj]) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				matchCount++
+			}
+		}
+		nameKey := nameKeys[i]
+		if nameKey == "" {
+			nameKey = idKeys[i]
+		}
+		distance := absInt(len(nameKey) - len(key))
+		if bestID == "" || matchCount > bestMatches || (matchCount == bestMatches && distance < bestDistance) {
+			bestMatches = matchCount
+			bestDistance = distance
+			bestID = m.ID
+		}
+	}
+	return bestID
+}
+
+func canonicalUpstreamModelID(modelID string) string {
+	return canonicalUpstreamModelIDIn(modelID, fetchModelsFromZAI())
+}
+
+func canonicalUpstreamModelIDIn(modelID string, models []ModelInfo) string {
+	if resolved := resolveModelAlias(modelID, models); resolved != "" {
+		return resolved
+	}
+	if isGLM53FlashAlias(modelID) {
+		if resolved := resolveModelAlias("x-preview-l", models); resolved != "" {
+			return resolved
+		}
+		return "x-preview-l"
+	}
+	return modelID
 }
 
 // resolveVisionModel returns a model that can actually see images. Text-only
 // models answer image requests with a long stall and then INTERNAL_ERROR, so
 // those get redirected. "" means none is available; send the request as-is.
 func resolveVisionModel(requested string) string {
-	if modelSupportsVision(requested) {
+	return resolveVisionModelIn(requested, fetchModelsFromZAI())
+}
+
+func resolveVisionModelIn(requested string, models []ModelInfo) string {
+	if modelSupportsVisionIn(requested, models) {
 		return requested
 	}
-	models := fetchModelsFromZAI()
 	for _, want := range visionModelPreference {
 		for _, m := range models {
 			if strings.EqualFold(m.ID, want) && capsHaveVision(m.Capabilities) {

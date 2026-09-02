@@ -303,8 +303,10 @@ func sendToZAI(ctx context.Context, prompt string, opts SendOptions) (<-chan ZAI
 	if model == "" {
 		model = "glm-4.7"
 	}
+	models := fetchModelsFromZAI()
+	model = canonicalUpstreamModelIDIn(model, models)
 
-	featuresMap := resolveFeaturesForModel(model)
+	featuresMap := resolveFeaturesForModelIn(model, models)
 
 	// Per-request overrides win over everything resolved above.
 	if opts.WebSearch != nil {
@@ -331,7 +333,7 @@ func sendToZAI(ctx context.Context, prompt string, opts SendOptions) (<-chan ZAI
 	delete(featuresMap, "reasoning_effort")
 
 	if opts.ReasoningEffort != "" {
-		if modelSupportsReasoningEffort(model) {
+		if modelSupportsReasoningEffortIn(model, models) {
 			if isValidReasoningEffort(opts.ReasoningEffort) {
 				featuresMap["reasoning_effort"] = opts.ReasoningEffort
 				// Requires thinking, so a user override is ignored here.
@@ -477,6 +479,9 @@ func sendToZAIStream(ctx context.Context, prompt string, opts struct {
 		}
 
 		bodyBytes, _ := json.Marshal(requestBody)
+		if shouldShimGLMPrompt(opts.ClientMessagesRaw) {
+			bodyBytes = shimGLMPrompt(bodyBytes)
+		}
 
 		if debugEnabled() {
 			logDebugf("Z.AI url %s", urlStr)

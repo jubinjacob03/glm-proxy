@@ -47,7 +47,11 @@ func snapshotModelFeatureState(modelID string) *ModelFeatureState {
 
 // resolveFeaturesForModel builds the feature map sent to /completions.
 func resolveFeaturesForModel(modelID string) map[string]interface{} {
-	caps := getModelCapabilities(modelID)
+	return resolveFeaturesForModelIn(modelID, fetchModelsFromZAI())
+}
+
+func resolveFeaturesForModelIn(modelID string, models []ModelInfo) map[string]interface{} {
+	caps := getModelCapabilitiesIn(modelID, models)
 	return resolveFeaturesWithState(caps, snapshotModelFeatureState(modelID))
 }
 

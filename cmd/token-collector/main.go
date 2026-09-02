@@ -42,16 +42,23 @@ import (
 )
 
 const (
-	MaxTokens                = 1500
-	UnsafeMaxTokens          = 1500
-	DefaultTokens            = 850
-	DefaultBatch             = 5
-	MaxBatch                 = 9
-	UnsafeMaxBatch           = 25
-	SendWaitMs               = 15000
-	MaxRetries               = 3
-	TokenCollectionTimeoutMs = 90000
-	URL                      = "https://chat.z.ai"
+	MaxTokens       = 20000
+	UnsafeMaxTokens = 50000
+	DefaultTokens   = 5000
+	DefaultBatch    = 5
+	MaxBatch        = 9
+	UnsafeMaxBatch  = 25
+	SendWaitMs      = 15000
+	MaxRetries      = 3
+
+	// The page setup dominates a run; generating a token is a local call in the
+	// captcha bundle, so the budget is a fixed floor plus a per-token allowance
+	// rather than one flat number that a large batch would always blow through.
+	TokenCollectionBaseMs     = 90000
+	TokenCollectionPerTokenMs = 60
+	TokenCollectionMaxMs      = 1200000
+
+	URL = "https://chat.z.ai"
 
 	// Extra grace for window.z_um after SendWaitMs: on a slow link the Aliyun
 	// CDN script has not run by then, which used to surface as a TypeError.
@@ -479,23 +486,29 @@ func label(paint func(string) string, text string) string {
 }
 
 func logStep(name, format string, args ...interface{}) {
-	fmt.Printf("%s %s\n", label(ansi.Cyan, name), fmt.Sprintf(format, args...))
+	logLine(os.Stdout, label(ansi.Cyan, name), format, args...)
 }
 
 func logOK(format string, args ...interface{}) {
-	fmt.Printf("%s %s\n", label(ansi.Green, "ok"), fmt.Sprintf(format, args...))
+	logLine(os.Stdout, label(ansi.Green, "ok"), format, args...)
 }
 
 func logWarn(format string, args ...interface{}) {
-	fmt.Printf("%s %s\n", label(ansi.Yellow, "warn"), fmt.Sprintf(format, args...))
+	logLine(os.Stdout, label(ansi.Yellow, "warn"), format, args...)
 }
 
 func logDone(format string, args ...interface{}) {
-	fmt.Printf("%s %s\n", label(ansi.Violet, "done"), fmt.Sprintf(format, args...))
+	logLine(os.Stdout, label(ansi.Violet, "done"), format, args...)
 }
 
 func logFail(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "%s %s\n", label(ansi.Red, "fail"), fmt.Sprintf(format, args...))
+	logLine(os.Stderr, label(ansi.Red, "fail"), format, args...)
+}
+
+func logLine(w *os.File, prefix, format string, args ...interface{}) {
+	fmt.Fprint(w, prefix, " ")
+	fmt.Fprintf(w, format, args...)
+	fmt.Fprint(w, "\n")
 }
 
 func promptInt(reader *bufio.Reader, prompt string, def, max int) int {
@@ -1293,9 +1306,19 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 		logOK("collected %d tokens in %.2fs", len(tokens), elapsed)
 		return tokens, nil
 
-	case <-time.After(TokenCollectionTimeoutMs * time.Millisecond):
-		return nil, fmt.Errorf("token collection timed out after %ds", TokenCollectionTimeoutMs/1000)
+	case <-time.After(tokenCollectionBudget(total)):
+		return nil, fmt.Errorf("token collection timed out after %ds", int(tokenCollectionBudget(total)/time.Second))
 	}
+}
+
+// tokenCollectionBudget scales the wait with the batch size so a small run still
+// fails fast while a large one is not cut off mid-collection.
+func tokenCollectionBudget(total int) time.Duration {
+	budget := time.Duration(TokenCollectionBaseMs+total*TokenCollectionPerTokenMs) * time.Millisecond
+	if max := time.Duration(TokenCollectionMaxMs) * time.Millisecond; budget > max {
+		return max
+	}
+	return budget
 }
 
 // newWorkerPage builds a worker with its own BrowserContext carrying a coherent
