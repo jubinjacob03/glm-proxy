@@ -502,6 +502,8 @@ func runTokenCollector(ctx context.Context, collector string) error {
 	cmd := exec.CommandContext(runCtx, collector,
 		"--no-tui",
 		"--batch", strconv.Itoa(config.TokenMonitor.Batch),
+		"--tokens", strconv.Itoa(config.TokenMonitor.PerBatch),
+		"--unsafe",
 		"--db-path", dbAbs,
 	)
 	cmd.Dir = filepath.Dir(collector)

@@ -83,3 +83,20 @@ func TestResolveModelAliasRegexClosestMatch(t *testing.T) {
 		t.Fatalf("resolveModelAlias closest = %q, want m-b", got)
 	}
 }
+
+func TestModelSupportsVisionFlashWhenCapabilitiesUnavailable(t *testing.T) {
+	models := []ModelInfo{{ID: "glm-5.3"}}
+	if !modelSupportsVisionIn("glm-5.3-flash", models) {
+		t.Fatal("expected glm-5.3-flash to stay vision-capable fallback")
+	}
+	if !modelSupportsVisionIn("x-preview-l", models) {
+		t.Fatal("expected x-preview-l to stay vision-capable fallback")
+	}
+}
+
+func TestResolveVisionModelKeepsFlashAlias(t *testing.T) {
+	models := []ModelInfo{{ID: "glm-5.3"}, {ID: "GLM-5v-Turbo", Capabilities: map[string]interface{}{"vision": true}}}
+	if got := resolveVisionModelIn("glm-5.3-flash", models); got != "glm-5.3-flash" {
+		t.Fatalf("resolveVisionModelIn flash = %q, want glm-5.3-flash", got)
+	}
+}

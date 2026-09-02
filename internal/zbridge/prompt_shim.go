@@ -1,6 +1,9 @@
 package zbridge
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 const shimSeparator = "\n\n---\n[SYSTEM INSTRUCTIONS]\n"
 
@@ -35,6 +38,10 @@ func shimGLMPrompt(body []byte) []byte {
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 {
 		return body
 	}
+	var full map[string]json.RawMessage
+	if err := json.Unmarshal(body, &full); err != nil {
+		return body
+	}
 
 	var systemTexts []string
 	var kept []json.RawMessage
@@ -62,10 +69,6 @@ func shimGLMPrompt(body []byte) []byte {
 	}
 
 	if len(systemTexts) == 0 {
-		var full map[string]json.RawMessage
-		if err := json.Unmarshal(body, &full); err != nil {
-			return body
-		}
 		b, err := json.Marshal(kept)
 		if err != nil {
 			return body
@@ -78,13 +81,14 @@ func shimGLMPrompt(body []byte) []byte {
 		return out
 	}
 
-	systemBlock := ""
+	var sb strings.Builder
 	for i, t := range systemTexts {
 		if i > 0 {
-			systemBlock += "\n\n"
+			sb.WriteString("\n\n")
 		}
-		systemBlock += t
+		sb.WriteString(t)
 	}
+	systemBlock := sb.String()
 
 	lastUserIdx := -1
 	for i := len(kept) - 1; i >= 0; i-- {
@@ -105,10 +109,6 @@ func shimGLMPrompt(body []byte) []byte {
 		kept[lastUserIdx] = appendToUserMessage(kept[lastUserIdx], shimSeparator+systemBlock)
 	}
 
-	var full map[string]json.RawMessage
-	if err := json.Unmarshal(body, &full); err != nil {
-		return body
-	}
 	b, err := json.Marshal(kept)
 	if err != nil {
 		return body
@@ -139,16 +139,18 @@ func extractMessageText(raw json.RawMessage) string {
 		Text string `json:"text"`
 	}
 	if json.Unmarshal(msg.Content, &parts) == nil {
-		out := ""
+		var b strings.Builder
+		wrote := false
 		for _, p := range parts {
 			if p.Type == "text" || p.Text != "" {
-				if out != "" {
-					out += "\n"
+				if wrote {
+					b.WriteByte('\n')
 				}
-				out += p.Text
+				b.WriteString(p.Text)
+				wrote = true
 			}
 		}
-		return out
+		return b.String()
 	}
 	return ""
 }
@@ -171,8 +173,7 @@ func appendToUserMessage(raw json.RawMessage, suffix string) json.RawMessage {
 	if json.Unmarshal(contentRaw, &s) == nil {
 		b, _ := json.Marshal(s + suffix)
 		msg["content"] = b
-		out, _ := json.Marshal(msg)
-		return out
+		return mustMarshalRawMessage(msg, raw)
 	}
 
 	var parts []map[string]json.RawMessage
@@ -202,9 +203,16 @@ func appendToUserMessage(raw json.RawMessage, suffix string) json.RawMessage {
 		}
 		b, _ := json.Marshal(parts)
 		msg["content"] = b
-		out, _ := json.Marshal(msg)
-		return out
+		return mustMarshalRawMessage(msg, raw)
 	}
 
 	return raw
+}
+
+func mustMarshalRawMessage(v interface{}, fallback json.RawMessage) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }

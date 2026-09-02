@@ -71,11 +71,12 @@ type Config struct {
 	}
 	TokenMonitor struct {
 		Enabled       bool          // TOKEN_MONITOR, default true
-		MinTokens     int           // TOKEN_MIN, default 50
+		MinTokens     int           // TOKEN_MIN, default 750
 		Interval      time.Duration // TOKEN_MONITOR_INTERVAL_SECONDS, default 60
 		Batch         int           // TOKEN_COLLECT_BATCH, default 2
+		PerBatch      int           // TOKEN_COLLECT_TOKENS, default 5000
 		CollectorPath string        // TOKEN_COLLECTOR_PATH, default auto-detected
-		RunTimeout    time.Duration // TOKEN_COLLECT_TIMEOUT_SECONDS, default 900
+		RunTimeout    time.Duration // TOKEN_COLLECT_TIMEOUT_SECONDS, default 1800
 	}
 	// Runes held pending at the tail of streamed content. Z.AI's stream is
 	// edit-based and an append-only SSE client cannot take text back, so a small
@@ -211,10 +212,13 @@ func loadConfig() *Config {
 	c.Captcha.IdleWindow = 120 * time.Second
 	c.Captcha.PollInterval = 500 * time.Millisecond
 	c.TokenMonitor.Enabled = true
-	c.TokenMonitor.MinTokens = 50
+	// One token is spent per request, so the refill has to start while there is
+	// still enough stock to cover the collector's own run time under load.
+	c.TokenMonitor.MinTokens = 750
 	c.TokenMonitor.Interval = 60 * time.Second
 	c.TokenMonitor.Batch = 2
-	c.TokenMonitor.RunTimeout = 15 * time.Minute
+	c.TokenMonitor.PerBatch = 5000
+	c.TokenMonitor.RunTimeout = 30 * time.Minute
 	c.StreamHoldback = 24
 	c.SyncMode = false
 	c.SessionPoolSize = defaultPoolSize
@@ -298,6 +302,7 @@ func loadConfig() *Config {
 	}
 	envInt("TOKEN_MIN", &c.TokenMonitor.MinTokens, 0)
 	envInt("TOKEN_COLLECT_BATCH", &c.TokenMonitor.Batch, 1)
+	envInt("TOKEN_COLLECT_TOKENS", &c.TokenMonitor.PerBatch, 1)
 	envSeconds("TOKEN_MONITOR_INTERVAL_SECONDS", &c.TokenMonitor.Interval, 5)
 	envSeconds("TOKEN_COLLECT_TIMEOUT_SECONDS", &c.TokenMonitor.RunTimeout, 30)
 	if p := os.Getenv("TOKEN_COLLECTOR_PATH"); p != "" {

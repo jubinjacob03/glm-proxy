@@ -388,21 +388,30 @@ func getMessageContent(content json.RawMessage) string {
 	}
 	var arr []interface{}
 	if err := json.Unmarshal(content, &arr); err == nil {
-		var texts []string
+		var b strings.Builder
+		wrote := false
 		for _, item := range arr {
 			switch v := item.(type) {
 			case string:
-				texts = append(texts, v)
+				if wrote {
+					b.WriteByte('\n')
+				}
+				b.WriteString(v)
+				wrote = true
 			case map[string]interface{}:
 				t, _ := v["type"].(string)
 				if t == "text" {
 					if txt, ok := v["text"].(string); ok {
-						texts = append(texts, txt)
+						if wrote {
+							b.WriteByte('\n')
+						}
+						b.WriteString(txt)
+						wrote = true
 					}
 				}
 			}
 		}
-		return strings.Join(texts, "\n")
+		return b.String()
 	}
 	return string(content)
 }
