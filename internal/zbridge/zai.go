@@ -303,6 +303,7 @@ func sendToZAI(ctx context.Context, prompt string, opts SendOptions) (<-chan ZAI
 	if model == "" {
 		model = "glm-4.7"
 	}
+	model = canonicalUpstreamModelID(model)
 
 	featuresMap := resolveFeaturesForModel(model)
 
@@ -477,6 +478,9 @@ func sendToZAIStream(ctx context.Context, prompt string, opts struct {
 		}
 
 		bodyBytes, _ := json.Marshal(requestBody)
+		if shouldShimGLMPrompt(opts.ClientMessagesRaw) {
+			bodyBytes = shimGLMPrompt(bodyBytes)
+		}
 
 		if debugEnabled() {
 			logDebugf("Z.AI url %s", urlStr)

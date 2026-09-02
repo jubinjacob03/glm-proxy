@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -146,6 +147,7 @@ func getModelCapabilities(modelID string) map[string]interface{} {
 // modelSupportsReasoningEffort needs the capability explicitly true; false and
 // missing both mean unsupported.
 func modelSupportsReasoningEffort(modelID string) bool {
+	modelID = canonicalUpstreamModelID(modelID)
 	if modelID == "" {
 		return false
 	}
@@ -172,10 +174,138 @@ func capsHaveVision(caps map[string]interface{}) bool {
 
 // modelSupportsVision reports whether Z.AI advertises image input.
 func modelSupportsVision(modelID string) bool {
+	modelID = canonicalUpstreamModelID(modelID)
 	if modelID == "" {
 		return false
 	}
 	return capsHaveVision(getModelCapabilities(modelID))
+}
+
+func modelAliasKey(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+var modelAliasTokenRe = regexp.MustCompile(`[a-z0-9]+`)
+
+func uniqueLowerTokens(s string) []string {
+	raw := modelAliasTokenRe.FindAllString(strings.ToLower(s), -1)
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, t := range raw {
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
+func compileModelAliasRegex(tokens []string) *regexp.Regexp {
+	if len(tokens) == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString(`(?i)\b(?:`)
+	for i, t := range tokens {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		b.WriteString(regexp.QuoteMeta(t))
+	}
+	b.WriteString(`)\b`)
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return nil
+	}
+	return re
+}
+
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func resolveModelAlias(modelID string, models []ModelInfo) string {
+	if modelID == "" {
+		return ""
+	}
+	for _, m := range models {
+		if strings.EqualFold(m.ID, modelID) {
+			return m.ID
+		}
+	}
+	key := modelAliasKey(modelID)
+	if key == "" {
+		return ""
+	}
+	for _, m := range models {
+		if modelAliasKey(m.ID) == key || modelAliasKey(m.Name) == key {
+			return m.ID
+		}
+	}
+	tokens := uniqueLowerTokens(modelID)
+	re := compileModelAliasRegex(tokens)
+	if re == nil {
+		return ""
+	}
+	bestID := ""
+	bestMatches := 0
+	bestDistance := 0
+	for _, m := range models {
+		candidate := strings.ToLower(strings.TrimSpace(m.ID + " " + m.Name))
+		hits := re.FindAllString(candidate, -1)
+		if len(hits) == 0 {
+			continue
+		}
+		seenHits := make(map[string]struct{}, len(hits))
+		for _, h := range hits {
+			seenHits[strings.ToLower(h)] = struct{}{}
+		}
+		matchCount := len(seenHits)
+		nameKey := modelAliasKey(m.Name)
+		if nameKey == "" {
+			nameKey = modelAliasKey(m.ID)
+		}
+		distance := absInt(len(nameKey) - len(key))
+		if bestID == "" || matchCount > bestMatches || (matchCount == bestMatches && distance < bestDistance) {
+			bestMatches = matchCount
+			bestDistance = distance
+			bestID = m.ID
+		}
+	}
+	return bestID
+}
+
+func canonicalUpstreamModelID(modelID string) string {
+	models := fetchModelsFromZAI()
+	if resolved := resolveModelAlias(modelID, models); resolved != "" {
+		return resolved
+	}
+	if modelAliasKey(modelID) == modelAliasKey("glm-5.3-flash") {
+		if resolved := resolveModelAlias("x-preview-l", models); resolved != "" {
+			return resolved
+		}
+		return "x-preview-l"
+	}
+	return modelID
 }
 
 // resolveVisionModel returns a model that can actually see images. Text-only
