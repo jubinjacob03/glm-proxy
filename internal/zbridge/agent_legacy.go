@@ -213,6 +213,27 @@ func (a *agentStreamInterceptor) resetToolCallState() {
 	a.tcFallback = false
 }
 
+// RewindToValid truncates the buffer when a deep edit rewinds the stream.
+func (a *agentStreamInterceptor) RewindToValid(cp, oldLen int) {
+	clientLen := oldLen - a.buf.Len()
+	if cp <= clientLen {
+		a.buf.Reset()
+		a.flushed = 0
+		a.resetToolCallState()
+		a.emitting = false
+	} else {
+		validLen := cp - clientLen
+		if validLen < a.buf.Len() {
+			s := a.buf.String()[:validLen]
+			a.buf.Reset()
+			a.buf.WriteString(s)
+			if a.flushed > validLen {
+				a.flushed = validLen
+			}
+		}
+	}
+}
+
 // tryExtractName pulls "name" out of partial JSON with the offset after its
 // closing quote, or "" and -1. It stops before "arguments" so nested keys cannot
 // match.

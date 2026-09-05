@@ -393,10 +393,10 @@ func isValidReasoningEffort(value string) bool {
 	}
 }
 
-func architectureFor(caps map[string]interface{}) map[string]interface{} {
+func architectureFor(modelID string, caps map[string]interface{}, models []ModelInfo) map[string]interface{} {
 	inputModalities := []string{"text"}
 	modality := "text->text"
-	if capsHaveVision(caps) {
+	if capsHaveVision(caps) || modelSupportsVisionIn(modelID, models) {
 		inputModalities = []string{"text", "image"}
 		modality = "text+image->text"
 	}
@@ -407,25 +407,50 @@ func architectureFor(caps map[string]interface{}) map[string]interface{} {
 	}
 }
 
+func buildModelData(m ModelInfo, now int64, models []ModelInfo) map[string]interface{} {
+	return map[string]interface{}{
+		"id":           m.ID,
+		"object":       "model",
+		"created":      now,
+		"owned_by":     "z-ai",
+		"display_name": m.Name,
+		"description":  m.Description,
+		"architecture": architectureFor(m.ID, m.Capabilities, models),
+	}
+}
+
 func modelsHandler(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 	models := fetchModelsFromZAI()
 	data := make([]map[string]interface{}, 0, len(models))
 	for _, m := range models {
-		data = append(data, map[string]interface{}{
-			"id":           m.ID,
-			"object":       "model",
-			"created":      now,
-			"owned_by":     "z-ai",
-			"display_name": m.Name,
-			"description":  m.Description,
-			"architecture": architectureFor(m.Capabilities),
-		})
+		data = append(data, buildModelData(m, now, models))
 	}
 	writeJSON(w, 200, map[string]interface{}{
 		"object": "list",
 		"data":   data,
 	})
+}
+
+func singleModelHandler(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	modelID := strings.TrimPrefix(path, "/v1/models/")
+	if modelID == "" {
+		modelsHandler(w, r)
+		return
+	}
+
+	now := time.Now().Unix()
+	models := fetchModelsFromZAI()
+	canonical := canonicalUpstreamModelIDIn(modelID, models)
+
+	for _, m := range models {
+		if strings.EqualFold(m.ID, modelID) || strings.EqualFold(m.ID, canonical) {
+			writeJSON(w, 200, buildModelData(m, now, models))
+			return
+		}
+	}
+	writeJSON(w, 404, formatOpenAIError("model '"+modelID+"' not found", "invalid_request_error", nil))
 }
 
 func modelsHandler2(w http.ResponseWriter, r *http.Request) {

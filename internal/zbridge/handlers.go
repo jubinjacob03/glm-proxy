@@ -205,6 +205,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		var reasoningBuf strings.Builder
 		contentSeeded := false
 		fullContent := ""
+		streamedContentLen := 0
+		reasoningDone := false
 
 		var interceptor agentInterceptor
 		if config.AgentMode {
@@ -302,11 +304,17 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 					}
 					continue
 				}
+
+				if result.Chunk != "" && reasoningBuf.Len() > 0 && !reasoningDone {
+					reasoningDone = true
+				}
+
 				if result.FullText != "" && !strings.HasPrefix(result.FullText, fullContent) {
 					// A deep edit_content rewrite rewound already-forwarded text,
-					// so the interceptor's view is stale; reset it (issue #23).
+					// so the interceptor's view is stale; rewind it to the common prefix (issue #23).
 					if interceptor != nil {
-						interceptor = newAgentInterceptor(body.Tools)
+						cp := commonPrefixLen(fullContent, result.FullText)
+						interceptor.RewindToValid(cp, len(fullContent))
 					}
 				}
 				if result.FullText != "" {
@@ -327,6 +335,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				if delta == "" {
 					continue
 				}
+
+				streamedContentLen += len(delta)
 
 				if interceptor != nil {
 					contentDelta, toolCalls := interceptor.feed(delta)
@@ -371,10 +381,20 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			stopKeepAlive()
+			promptTokens := estimateTokens(prompt)
+			completionTokens := (streamedContentLen + 3) / 4
+			if reasoningBuf.Len() > 0 {
+				completionTokens += (reasoningBuf.Len() + 3) / 4
+			}
+			usage := &oaUsage{
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
+				TotalTokens:      promptTokens + completionTokens,
+			}
 			if toolCallEmitted {
-				sse.data(oaToolCallsStopChunk(model, requestId))
+				sse.data(oaToolCallsStopChunkWithUsage(model, requestId, usage))
 			} else {
-				sse.data(oaStopChunk(model, requestId))
+				sse.data(oaStopChunkWithUsage(model, requestId, usage))
 			}
 			sse.raw("[DONE]")
 		}

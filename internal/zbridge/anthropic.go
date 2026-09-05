@@ -647,9 +647,10 @@ func anthropicStreamResponse(ctx context.Context, w http.ResponseWriter, r *http
 
 		if result.FullText != "" && !strings.HasPrefix(result.FullText, fullContent) {
 			// A deep edit_content rewrite rewound already-forwarded text, so the
-			// interceptor's view is stale; reset it (issue #23).
+			// interceptor's view is stale; rewind it to the common prefix (issue #23).
 			if interceptor != nil {
-				interceptor = newAgentInterceptor(opts.ToolsRaw)
+				cp := commonPrefixLen(fullContent, result.FullText)
+				interceptor.RewindToValid(cp, len(fullContent))
 			}
 		}
 		if result.FullText != "" {

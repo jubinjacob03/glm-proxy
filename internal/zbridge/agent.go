@@ -1487,6 +1487,23 @@ type AgentParsedChunk struct {
 // stream that opened a tool call and never closed it can reach it.
 const maxAgentHold = 4 << 20
 
+// RewindToValid discards the trailing portion of the buffer when the upstream
+// stream rewrites already-emitted text. cp is the length of the common prefix
+// between the old and new text, and oldLen is the length of the old text.
+// This prevents dropped text and split markers when an edit_content event occurs.
+func (in *AgentStreamInterceptor) RewindToValid(cp, oldLen int) {
+	clientLen := oldLen - len(in.buffer)
+	if cp <= clientLen {
+		in.buffer = ""
+	} else {
+		validLen := cp - clientLen
+		if validLen < len(in.buffer) {
+			in.buffer = in.buffer[:validLen]
+		}
+	}
+	in.offset = 0
+}
+
 func (in *AgentStreamInterceptor) Feed(chunk string) AgentParsedChunk {
 	in.buffer += chunk
 	parsed := in.drain(false)
@@ -1881,6 +1898,7 @@ func agentStripToolCalls(text string, toolsRaw json.RawMessage) string {
 type agentInterceptor interface {
 	feed(chunk string) (content string, toolCalls []map[string]interface{})
 	finish() (content string, toolCalls []map[string]interface{})
+	RewindToValid(cp, oldLen int)
 }
 
 type modernAgentInterceptor struct{ in *AgentStreamInterceptor }
@@ -1895,6 +1913,10 @@ func (m *modernAgentInterceptor) finish() (string, []map[string]interface{}) {
 	return p.Content, p.ToolCalls
 }
 
+func (m *modernAgentInterceptor) RewindToValid(cp, oldLen int) {
+	m.in.RewindToValid(cp, oldLen)
+}
+
 // legacyAgentInterceptor streams arguments incrementally. Its finish returns
 // trailing content only; end-of-stream calls fall to the caller's
 // agentExtractToolCalls safety net.
@@ -1907,6 +1929,10 @@ func (l *legacyAgentInterceptor) feed(chunk string) (string, []map[string]interf
 
 func (l *legacyAgentInterceptor) finish() (string, []map[string]interface{}) {
 	return l.in.flushFinal(), nil
+}
+
+func (l *legacyAgentInterceptor) RewindToValid(cp, oldLen int) {
+	l.in.RewindToValid(cp, oldLen)
 }
 
 // newAgentInterceptor builds the interceptor for the active shim.

@@ -19,10 +19,11 @@ func formatOpenAIResponse(result ResponseResult, model, requestId string, stream
 	reason := "stop"
 
 	return oaChunk{
-		ID:      "chatcmpl-" + requestId,
-		Object:  "chat.completion",
-		Created: nowUnix(),
-		Model:   model,
+		ID:                "chatcmpl-" + requestId,
+		Object:            "chat.completion",
+		Created:           nowUnix(),
+		Model:             model,
+		SystemFingerprint: proxyFingerprint,
 		Choices: []oaChoice{{
 			Index: 0,
 			Message: &oaMessage{
@@ -53,10 +54,11 @@ func formatOpenAIToolCallResponse(model, requestId, content, reasoning, prompt s
 	}
 
 	return oaChunk{
-		ID:      "chatcmpl-" + requestId,
-		Object:  "chat.completion",
-		Created: nowUnix(),
-		Model:   model,
+		ID:                "chatcmpl-" + requestId,
+		Object:            "chat.completion",
+		Created:           nowUnix(),
+		Model:             model,
+		SystemFingerprint: proxyFingerprint,
 		Choices: []oaChoice{{
 			Index: 0,
 			Message: &oaMessage{

@@ -117,21 +117,25 @@ type oaChoice struct {
 }
 
 type oaChunk struct {
-	ID      string     `json:"id"`
-	Object  string     `json:"object"`
-	Created int64      `json:"created"`
-	Model   string     `json:"model"`
-	Choices []oaChoice `json:"choices"`
-	Usage   *oaUsage   `json:"usage,omitempty"`
+	ID                string     `json:"id"`
+	Object            string     `json:"object"`
+	Created           int64      `json:"created"`
+	Model             string     `json:"model"`
+	SystemFingerprint string     `json:"system_fingerprint"`
+	Choices           []oaChoice `json:"choices"`
+	Usage             *oaUsage   `json:"usage,omitempty"`
 }
+
+const proxyFingerprint = "fp_glm_proxy"
 
 func newOAChunk(model, requestID string, delta *oaDelta, finishReason *string) oaChunk {
 	return oaChunk{
-		ID:      "chatcmpl-" + requestID,
-		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
-		Model:   model,
-		Choices: []oaChoice{{Index: 0, Delta: delta, FinishReason: finishReason}},
+		ID:                "chatcmpl-" + requestID,
+		Object:            "chat.completion.chunk",
+		Created:           time.Now().Unix(),
+		Model:             model,
+		SystemFingerprint: proxyFingerprint,
+		Choices:           []oaChoice{{Index: 0, Delta: delta, FinishReason: finishReason}},
 	}
 }
 
@@ -154,11 +158,25 @@ func oaRoleInit(model, requestID string) oaChunk {
 }
 
 func oaStopChunk(model, requestID string) oaChunk {
-	empty, reason := "", "stop"
-	return newOAChunk(model, requestID, &oaDelta{Content: &empty}, &reason)
+	reason := "stop"
+	return newOAChunk(model, requestID, &oaDelta{}, &reason)
+}
+
+func oaStopChunkWithUsage(model, requestID string, usage *oaUsage) oaChunk {
+	reason := "stop"
+	c := newOAChunk(model, requestID, &oaDelta{}, &reason)
+	c.Usage = usage
+	return c
 }
 
 func oaToolCallsStopChunk(model, requestID string) oaChunk {
 	reason := "tool_calls"
 	return newOAChunk(model, requestID, &oaDelta{}, &reason)
+}
+
+func oaToolCallsStopChunkWithUsage(model, requestID string, usage *oaUsage) oaChunk {
+	reason := "tool_calls"
+	c := newOAChunk(model, requestID, &oaDelta{}, &reason)
+	c.Usage = usage
+	return c
 }
