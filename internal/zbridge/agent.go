@@ -911,12 +911,21 @@ func extractImageParts(rawMessages json.RawMessage) []json.RawMessage {
 	if json.Unmarshal(rawMessages, &msgs) != nil {
 		return nil
 	}
+	var allImgs []json.RawMessage
 	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == "assistant" {
+			break
+		}
 		if msgs[i].Role == "user" {
-			return imagePartsOfContent(msgs[i].Content)
+			if imgs := imagePartsOfContent(msgs[i].Content); len(imgs) > 0 {
+				allImgs = append(allImgs, imgs...)
+			}
 		}
 	}
-	return nil
+	for i, j := 0, len(allImgs)-1; i < j; i, j = i+1, j-1 {
+		allImgs[i], allImgs[j] = allImgs[j], allImgs[i]
+	}
+	return allImgs
 }
 
 // imagePartsOfContent returns the image_url/input_image parts of one message's
@@ -1271,9 +1280,9 @@ func StripAgentToolCalls(text string, toolsRaw json.RawMessage) string {
 const fnCallsOpen = "<function_calls>"
 
 var (
-	fnInvokeRe   = regexp.MustCompile(`(?s)<invoke\s+name=["']([^"']+)["']\s*>(.*?)</invoke>`)
-	fnParamRe    = regexp.MustCompile(`(?s)<parameter\s+name=["']([^"']+)["']\s*>(.*?)</parameter>`)
-	fnCallsTagRe = regexp.MustCompile(`</?function_calls>`)
+	fnInvokeRe   = regexp.MustCompile(`(?i)(?s)\s*<invoke\s+name=["']([^"']+)["']\s*>(.*?)</invoke>\s*`)
+	fnParamRe    = regexp.MustCompile(`(?i)(?s)<parameter\s+name=["']([^"']+)["']\s*>(.*?)</parameter>`)
+	fnCallsTagRe = regexp.MustCompile(`(?i)(?s)\s*</?function_calls[^>]*>\s*`)
 )
 
 // fnStartTokens open a Trae tool block; the interceptor holds content back from
@@ -1448,8 +1457,9 @@ func stripFunctionCalls(text string) string {
 // interceptor's trailing keep-window, which is wider than any of them.
 func functionCallsSafeLen(s string) int {
 	safe := len(s)
+	lowerS := strings.ToLower(s)
 	for _, tok := range fnStartTokens {
-		if i := strings.Index(s, tok); i >= 0 && i < safe {
+		if i := strings.Index(lowerS, tok); i >= 0 && i < safe {
 			safe = i
 		}
 	}
@@ -1744,20 +1754,11 @@ func renderAssistantContent(m agentMessage) string {
 }
 
 // agentNativeUserMessage renders a user turn. The current turn carries the tool
-// contract and keeps its images; earlier turns fold to text so a stale image
-// never rides a new turn.
+// contract; earlier turns fold to text. Images are handled at the transform level.
 func agentNativeUserMessage(m agentMessage, isCurrent bool, tools []openAITool) map[string]interface{} {
 	text := contentToText(m.Content)
 	if isCurrent {
 		text = agentNativeCurrentTurnText(text, tools)
-		if imgs := imagePartsOfContent(m.Content); len(imgs) > 0 {
-			content := make([]interface{}, 0, len(imgs)+1)
-			content = append(content, map[string]interface{}{"type": "text", "text": text})
-			for _, img := range imgs {
-				content = append(content, img)
-			}
-			return map[string]interface{}{"role": "user", "content": content}
-		}
 	}
 	return map[string]interface{}{"role": "user", "content": text}
 }
@@ -1844,7 +1845,27 @@ func transformMessagesForAgentNative(rawMessages, toolsRaw json.RawMessage) ([]b
 	if len(toolsRaw) > 0 {
 		_ = json.Unmarshal(toolsRaw, &tools)
 	}
-	return json.Marshal(buildAgentNativeMessages(msgs, tools))
+	out := buildAgentNativeMessages(msgs, tools)
+
+	// Attach image parts that the flattening above dropped, on the last user
+	// message as a content array. Text-only conversations are unaffected.
+	if imgs := extractImageParts(rawMessages); len(imgs) > 0 && len(out) > 0 {
+		for i := len(out) - 1; i >= 0; i-- {
+			if out[i]["role"] == "user" {
+				if text, ok := out[i]["content"].(string); ok {
+					content := make([]interface{}, 0, len(imgs)+1)
+					content = append(content, map[string]interface{}{"type": "text", "text": text})
+					for _, img := range imgs {
+						content = append(content, img)
+					}
+					out[i]["content"] = content
+				}
+				break
+			}
+		}
+	}
+
+	return json.Marshal(out)
 }
 
 // transformMessagesForAgentModern folds conversation and contract into one

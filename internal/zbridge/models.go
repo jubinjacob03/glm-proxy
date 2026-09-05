@@ -396,7 +396,7 @@ func isValidReasoningEffort(value string) bool {
 func architectureFor(modelID string, caps map[string]interface{}, models []ModelInfo) map[string]interface{} {
 	inputModalities := []string{"text"}
 	modality := "text->text"
-	if capsHaveVision(caps) || modelSupportsVisionIn(modelID, models) {
+	if modelSupportsVisionIn(modelID, models) {
 		inputModalities = []string{"text", "image"}
 		modality = "text+image->text"
 	}
@@ -408,6 +408,7 @@ func architectureFor(modelID string, caps map[string]interface{}, models []Model
 }
 
 func buildModelData(m ModelInfo, now int64, models []ModelInfo) map[string]interface{} {
+	supportsVision := modelSupportsVisionIn(m.ID, models)
 	return map[string]interface{}{
 		"id":           m.ID,
 		"object":       "model",
@@ -416,6 +417,11 @@ func buildModelData(m ModelInfo, now int64, models []ModelInfo) map[string]inter
 		"display_name": m.Name,
 		"description":  m.Description,
 		"architecture": architectureFor(m.ID, m.Capabilities, models),
+		"vision":       supportsVision,
+		"multimodal":   supportsVision,
+		"capabilities": map[string]interface{}{
+			"vision": supportsVision,
+		},
 	}
 }
 
