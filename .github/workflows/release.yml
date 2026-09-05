@@ -139,8 +139,16 @@ jobs:
             if (-not (Test-Path $a)) { throw "missing release asset: $a" }
           }
 
+          $releaseExists = $false
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
+            $releaseExists = $true
+          }
+          elseif ($LASTEXITCODE -ne 1) {
+            throw "gh release view failed"
+          }
+
+          if ($releaseExists) {
             # Re-publishing the same tag ships a build no client will ever take:
             # the tray only updates when the version is strictly newer. Allow it
             # only when asked for explicitly, so a forgotten APP_VERSION bump is
