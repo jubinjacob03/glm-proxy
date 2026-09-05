@@ -143,8 +143,8 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		models := fetchModelsFromZAI()
 		if !modelSupportsVisionIn(model, models) {
 			if vm := resolveVisionModelIn(model, models); vm != "" {
-			logConsolef("[Vision] %s cannot accept images; routing this request to %s", printableASCII(model), vm)
-			upstreamModel = vm
+				logConsolef("[Vision] %s cannot accept images; routing this request to %s", printableASCII(model), vm)
+				upstreamModel = vm
 			} else {
 				logErrorf("[Vision] %s cannot accept images and no vision model is available", printableASCII(model))
 			}
@@ -244,7 +244,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			for {
 				select {
 				case <-ticker.C:
-					sse.data(oaContentDelta(model, requestId, ""))
+					sse.raw("{}")
 				case <-keepAliveStop:
 					return
 				}
@@ -291,7 +291,15 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 				if result.Reasoning != "" {
 					reasoningBuf.WriteString(result.Reasoning)
-					sse.data(oaReasoningDelta(model, requestId, result.Reasoning))
+					reasoningDeltaModel := upstreamModel
+					if reasoningDeltaModel == "" {
+						reasoningDeltaModel = model
+					}
+					if !config.AgentMode {
+						sse.data(oaContentDelta(reasoningDeltaModel, requestId, result.Reasoning))
+					} else {
+						sse.data(oaReasoningDelta(reasoningDeltaModel, requestId, result.Reasoning))
+					}
 					continue
 				}
 				if result.FullText != "" && !strings.HasPrefix(result.FullText, fullContent) {

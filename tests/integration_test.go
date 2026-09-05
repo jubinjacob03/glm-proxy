@@ -130,6 +130,9 @@ func TestHTTPEndToEndGarbleFix(t *testing.T) {
 				reasoning += ch.Delta.ReasoningContent
 			}
 		}
+		if len(chunk.Choices) == 0 && line != "data: {}" {
+			t.Errorf("unexpected keep-alive payload: %s", line)
+		}
 	}
 
 	if strings.Contains(clientText, "<det") || strings.Contains(clientText, "<details") {

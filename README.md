@@ -1,12 +1,12 @@
-# GLM Bridge — Z.AI Proxy for Trae
+# GLM Bridge — Z.AI Proxy for Trae and VS Code
 
-An **OpenAI**- and **Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z.ai), **purpose-built to run Z.AI's GLM models as a native agent inside [Trae](https://trae.ai)** (ByteDance's agentic IDE). It bridges Trae's native OpenAI function-calling to Z.AI's chat backend so GLM behaves like a first-class Trae model — real tool calls, multi-turn memory, and no re-answering of earlier messages — without browser automation or complex runtime setup.
+An **OpenAI**- and **Anthropic-compatible** API proxy for [chat.z.ai](https://chat.z.ai), built to run Z.AI's GLM models cleanly inside both [Trae](https://trae.ai) and VS Code clients. It preserves Trae's native agent / tool-calling flow while also shaping generic OpenAI-compatible streaming safely for editors that do not understand Trae-specific reasoning semantics, so GLM behaves like a first-class coding model without browser automation or complex runtime setup.
 
-> ### 🎯 Built for Trae
+> ### 🎯 Built for Trae, safe for VS Code
 >
-> This proxy is tuned and tested specifically for **Trae**. Agent mode defaults to a **native, role-preserving** transform: it preserves the `system`/`user`/`assistant`/`tool` conversation Trae sends, and converts GLM's textual tool calls back into the **native OpenAI `tool_calls`** Trae expects (both `<<<TOOL_CALL>>>` and Anthropic-style `<function_calls>` output are recognized). The endpoints remain generic OpenAI/Anthropic, so other clients still work, but Trae is the target.
+> This proxy is still optimized for **Trae**, but the streaming layer is now also shaped to work cleanly with **VS Code** and other generic OpenAI-style clients. In agent mode it preserves Trae's native `system`/`user`/`assistant`/`tool` flow and emits native `tool_calls`. Outside agent mode it avoids Trae-specific reasoning-only stream semantics and uses client-safe OpenAI content streaming so normal answer text does not get trapped inside a thinking UI.
 >
-> See [Using with Trae](#using-with-trae) for setup.
+> See [Using with Trae](#using-with-trae) and [Using with VS Code / generic OpenAI clients](#using-with-vs-code--generic-openai-clients) for setup.
 
 ---
 
@@ -20,7 +20,7 @@ An **OpenAI**- and **Anthropic-compatible** API proxy for [chat.z.ai](https://ch
 - **Background captcha cache** — When agent mode is enabled, captcha params are pre-generated asynchronously (2 cached, 75 s TTL, auto-pauses after 2 min idle so it stops spending device tokens on nobody)
 - **Automatic token replenishment** — A background monitor watches the device token store and runs the collector when it drops below `TOKEN_MIN`, with exponential backoff on repeated failure
 - **Observability** — Real counters behind `/metrics` (Prometheus text) and `/admin/stats`, plus a `/health` check that reports the device token level rather than just session state
-- **Streaming + non-streaming** — Full SSE support with keep-alive pings every 5 s
+- **Streaming + non-streaming** — Full SSE support with keep-alive pings every 5 s, with OpenAI stream shaping that stays compatible with Trae and generic VS Code/OpenAI clients
 - **Agent mode (Trae-native)** — Translates OpenAI tools / function-calling into a text contract Z.AI can understand, then converts the model's tool-call output — both `<<<TOOL_CALL>>>` and Anthropic-style `<function_calls>` — back into native OpenAI `tool_calls` deltas. Defaults to the **native** role-preserving transform (keeps the real `system`/`user`/`assistant`/`tool` conversation so the model answers only the latest turn); a **modern** single-message fold and the original **legacy** `[ROLE: ...]` shim remain as fallbacks.
 - **Per-model feature resolution** — Features resolved per-model from Z.AI server capabilities, with user overrides stored per-model. `image_generation` is **always forced to `false`**.
 - **`reasoning_effort` support** — `high` / `max` values forwarded only when the model's capabilities explicitly allow it; `enable_thinking` is force-enabled when active
@@ -238,7 +238,7 @@ Add GLM as a **custom model** in Trae (Settings → Models → **Add Model** →
 | `AUTH_TOKEN`              | `Jubin,unlimited` | Accepted API keys for Bearer / `x-api-key` auth; comma-separated to allow several                                                                             |
 | `TIMEOUT`                 | `300000`          | Request timeout in milliseconds                                                                                                                               |
 | `ZAI_TOKEN`               | _(empty)_         | Hardcoded Z.AI JWT — skips guest initialization                                                                                                               |
-| `AGENT_MODE`              | `false`           | Enable agent mode (`1`/`true`/`yes`/`on` for the default shim, or a variant name `native`/`modern`/`legacy` to enable and pick the shim)                      |
+| `AGENT_MODE`              | `false`           | Enable agent mode (`1`/`true`/`yes`/`on` for the default shim, or a variant name `native`/`modern`/`legacy` to enable and pick the shim). Keep this off for generic VS Code / OpenAI clients unless you specifically need tool-agent behavior |
 | `AGENT_MODE_VARIANT`      | `native`          | Agent-mode shim variant: `native` (default, role-preserving), `modern` (folded fallback), or `legacy`                                                         |
 | `LOG_LEVEL`               | `info`            | `debug`, `info`, `warn`, `error`, `off`. `debug` logs every Z.AI request body, response header set, and SSE line, which is expensive on the streaming path    |
 | `LOG_FORMAT`              | `text`            | Log format                                                                                                                                                    |
@@ -705,7 +705,7 @@ print(resp.content[0].text)
 
 3. **Signature** — HMAC-SHA256 over `(sortedPayload | promptBase64 | timestamp)` with a salted bucket key derived from `SALT_KEY` and `timestamp / 300000`.
 
-4. **Streaming** — POST to `/api/v2/chat/completions` with `stream: true`, parse SSE chunks (`edit_content` with `edit_index`, `delta_content`, `content`, or OpenAI-style `choices[0].delta.content`), and forward as OpenAI-formatted SSE or Anthropic SSE events. Inline errors (HTTP 200 with `data.error`) are detected and surfaced. On `401`, the session is re-initialised and the request retried once.
+4. **Streaming** — POST to `/api/v2/chat/completions` with `stream: true`, parse SSE chunks (`edit_content` with `edit_index`, `delta_content`, `content`, or OpenAI-style `choices[0].delta.content`), and forward as OpenAI-formatted SSE or Anthropic SSE events. For OpenAI clients, agent mode preserves Trae-style reasoning and tool semantics, while non-agent mode folds reasoning into standard `content` deltas and uses neutral keep-alive frames for better VS Code / generic editor compatibility. Inline errors (HTTP 200 with `data.error`) are detected and surfaced. On `401`, the session is re-initialised and the request retried once.
 
    Field semantics mirror the official Z.AI web frontend (`prod-fe` bundle): `edit_content` replaces the accumulated text from `edit_index` onward, where `edit_index` is a **UTF-16 code-unit offset** (JavaScript `String.substring` indexing — a missing `edit_index` defaults to `0`, i.e. full replacement); `content` is a **full replacement**; `delta_content` appends. Deltas forwarded to clients are always cut on rune boundaries and a small tail (`STREAM_HOLDBACK`) is kept pending, so trailing backtracks never surface as replacement-character garble (issue #23).
 
