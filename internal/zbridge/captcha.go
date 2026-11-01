@@ -32,9 +32,19 @@ var (
 	// drive an index scan.
 	tokenCount     atomic.Int64
 	tokenCountAtNs atomic.Int64
+
+	purgeMu               sync.Mutex
+	lastPurgedMaxID       int64
+	lastTokenVerifiedAtNs atomic.Int64
+
+	aliyunInitURL   = "https://no8xfe.captcha-open-southeast.aliyuncs.com/"
+	aliyunVerifyURL = "https://no8xfe-verify.captcha-open-southeast.aliyuncs.com/"
 )
 
-const tokenCountTTL = 2 * time.Second
+const (
+	tokenCountTTL            = 2 * time.Second
+	tokenExpiryProbeInterval = 15 * time.Minute
+)
 
 // initDB opens the device-token store. The PRAGMAs mirror the collector's so the
 // two processes share the file instead of colliding on locks.
@@ -82,7 +92,7 @@ func initDB() error {
 	// Claim and delete in one statement, so two concurrent generators can never
 	// receive the same token.
 	claim, err := db.Prepare(
-		`DELETE FROM tokens WHERE id = (SELECT id FROM tokens ORDER BY id LIMIT 1) RETURNING token`)
+		`DELETE FROM tokens WHERE id = (SELECT id FROM tokens ORDER BY id LIMIT 1) RETURNING id, token`)
 	if err != nil {
 		db.Close()
 		return fmt.Errorf("prepare token claim: %w", err)
@@ -93,6 +103,11 @@ func initDB() error {
 		db.Close()
 		return fmt.Errorf("prepare token count: %w", err)
 	}
+
+	purgeMu.Lock()
+	lastPurgedMaxID = 0
+	purgeMu.Unlock()
+	lastTokenVerifiedAtNs.Store(0)
 
 	globalDB, stmtClaimToken, stmtCountToken = db, claim, count
 	refreshTokenCount()
@@ -139,12 +154,18 @@ func closeDB() {
 // claimToken removes and returns the oldest token. Tokens are single-use, so
 // claiming and deleting are one operation.
 func claimToken() (string, bool) {
+	_, token, ok := claimTokenWithID()
+	return token, ok
+}
+
+func claimTokenWithID() (int64, string, bool) {
 	if stmtClaimToken == nil {
 		logError("token store is not open")
-		return "", false
+		return 0, "", false
 	}
+	var id int64
 	var token string
-	if err := stmtClaimToken.QueryRow().Scan(&token); err != nil {
+	if err := stmtClaimToken.QueryRow().Scan(&id, &token); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			tokenCount.Store(0)
 			tokenCountAtNs.Store(time.Now().UnixNano())
@@ -155,13 +176,51 @@ func claimToken() (string, bool) {
 		} else {
 			logError("Failed to claim device token: " + err.Error())
 		}
-		return "", false
+		return 0, "", false
 	}
 	if tokenCount.Add(-1) < 0 {
 		tokenCount.Store(0)
 	}
 	metrics.tokensConsumed.Add(1)
-	return token, true
+	return id, token, true
+}
+
+func purgeExpiredTokens(failedID int64) int64 {
+	purgeMu.Lock()
+	defer purgeMu.Unlock()
+
+	if globalDB == nil {
+		return 0
+	}
+	if failedID > 0 && failedID <= lastPurgedMaxID {
+		return 0
+	}
+	var maxID int64
+	if err := globalDB.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM tokens`).Scan(&maxID); err != nil {
+		logError("Failed to query max token id for purge: " + err.Error())
+		return 0
+	}
+	if maxID == 0 {
+		if failedID > lastPurgedMaxID {
+			lastPurgedMaxID = failedID
+		}
+		tokenCount.Store(0)
+		tokenCountAtNs.Store(time.Now().UnixNano())
+		captchaCache.Clear()
+		return 0
+	}
+	res, err := globalDB.Exec(`DELETE FROM tokens WHERE id <= ?`, maxID)
+	if err != nil {
+		logError("Failed to purge expired tokens: " + err.Error())
+		return 0
+	}
+	deleted, _ := res.RowsAffected()
+	lastPurgedMaxID = maxID
+	captchaCache.Clear()
+	remaining := refreshTokenCount()
+	logConsolef("[Tokens] purged %d expired device token(s) from store (%d remaining); triggering fresh collection",
+		deleted, remaining)
+	return deleted
 }
 
 // getTokenCount reports tokens left, from a short-TTL cache so status endpoints
@@ -282,7 +341,7 @@ func initCaptcha(ctx context.Context) (string, error) {
 	var result InitCaptchaResponse
 	if err := postForm(
 		ctx,
-		"https://no8xfe.captcha-open-southeast.aliyuncs.com/",
+		aliyunInitURL,
 		buildQueryString(params), nil, &result); err != nil {
 		return "", fmt.Errorf("InitCaptchaV3: %w", err)
 	}
@@ -474,7 +533,7 @@ func verifyCaptcha(ctx context.Context, certifyID, dataValue, deviceToken string
 	var respJSON VerifyCaptchaResponse
 	if err := postForm(
 		ctx,
-		"https://no8xfe-verify.captcha-open-southeast.aliyuncs.com/",
+		aliyunVerifyURL,
 		buildQueryString(params), map[string]string{"Referer": ""}, &respJSON); err != nil {
 		return "", fmt.Errorf("VerifyCaptchaV3: %w", err)
 	}
@@ -492,11 +551,13 @@ func verifyCaptcha(ctx context.Context, certifyID, dataValue, deviceToken string
 			if err != nil {
 				return "", err
 			}
+			lastTokenVerifiedAtNs.Store(time.Now().UnixNano())
 			return base64Encode(fpJSON), nil
 		}
 		logError("VerifyCaptchaV3 succeeded but securityToken/certifyId empty for deviceToken=" + deviceToken)
 	} else if respJSON.Success {
 		logError("deviceToken failed verification (VerifyResult=false): " + deviceToken)
+		return "", errDeviceTokenExpired
 	} else {
 		logError("VerifyCaptchaV3 request unsuccessful for deviceToken=" + deviceToken)
 	}
@@ -507,6 +568,8 @@ func verifyCaptcha(ctx context.Context, certifyID, dataValue, deviceToken string
 // only the collector can.
 var errNoDeviceTokens = errors.New("no device tokens remaining")
 
+var errDeviceTokenExpired = errors.New("device token expired or rejected (VerifyResult=false)")
+
 // tokenDemand lets a request that hit an empty store ask the monitor to collect
 // now rather than waiting out its poll interval.
 var tokenDemand = make(chan struct{}, 1)
@@ -514,7 +577,11 @@ var tokenDemand = make(chan struct{}, 1)
 // collectorHealthy reports whether the monitor is running and its last run
 // succeeded. Waiting on a working collector is worth it; waiting on a broken one
 // would stall every request for the full captcha budget, so that case fails fast.
-var collectorHealthy atomic.Bool
+var (
+	collectorHealthy      atomic.Bool
+	collectorAvailable    atomic.Bool
+	lastCollectorFailAtNs atomic.Int64
+)
 
 // requestTokenCollection nudges the monitor. Non-blocking: one pending request is
 // enough, since a run collects a whole batch.
@@ -533,10 +600,11 @@ func waitForDeviceTokens(ctx context.Context) bool {
 	if getTokenCount() > 0 {
 		return true
 	}
-	if !collectorHealthy.Load() {
+	if !collectorHealthy.Load() && !collectorAvailable.Load() && !collectorRunning.Load() {
 		// Nothing will refill it: the monitor is off, or its collector is failing.
 		return false
 	}
+	waitStartNs := time.Now().UnixNano()
 	requestTokenCollection()
 	logConsolef("[Tokens] store is empty; holding this request while the collector stocks it " +
 		"(a first run downloads a browser too, so allow a minute or two)")
@@ -552,7 +620,7 @@ func waitForDeviceTokens(ctx context.Context) bool {
 				logConsolef("[Tokens] tokens available; resuming the held request")
 				return true
 			}
-			if !collectorHealthy.Load() {
+			if !collectorRunning.Load() && (!collectorHealthy.Load() && (!collectorAvailable.Load() || lastCollectorFailAtNs.Load() > waitStartNs)) {
 				logConsolef("[Tokens] collector is not succeeding; releasing the held request")
 				return false
 			}
@@ -560,19 +628,88 @@ func waitForDeviceTokens(ctx context.Context) bool {
 	}
 }
 
+func shouldProbeTokenStore() bool {
+	last := lastTokenVerifiedAtNs.Load()
+	if last == 0 {
+		return true
+	}
+	return time.Since(time.Unix(0, last)) >= tokenExpiryProbeInterval
+}
+
+func probeStoredTokens(ctx context.Context) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	var lastTokenID int64
+	expiredCount := 0
+	for i := 0; i < 2; i++ {
+		if probeCtx.Err() != nil {
+			return true
+		}
+		payload, tokenID, err := tryComputeWithID(probeCtx)
+		if err == nil && payload != "" {
+			if config.AgentMode {
+				captchaCache.Put(payload)
+			}
+			return true
+		}
+		if errors.Is(err, errDeviceTokenExpired) {
+			lastTokenID = tokenID
+			expiredCount++
+			continue
+		}
+		if errors.Is(err, errNoDeviceTokens) {
+			return false
+		}
+		lastTokenVerifiedAtNs.Store(time.Now().UnixNano())
+		return true
+	}
+	if expiredCount >= 2 {
+		purgeExpiredTokens(lastTokenID)
+		return false
+	}
+	return true
+}
+
 // computeFinalPayload produces one CaptchaVerifyParam, retrying transient
 // failures with a short backoff.
 func computeFinalPayload(ctx context.Context) string {
 	backoff := 250 * time.Millisecond
+	expiredInRow := 0
+	purgedOnce := false
 	for attempt := 1; attempt <= maxTokenRetries; attempt++ {
 		if ctx.Err() != nil {
 			return ""
 		}
 
-		payload, err := tryCompute(ctx)
+		payload, tokenID, err := tryComputeWithID(ctx)
 		switch {
 		case err == nil && payload != "":
 			return payload
+		case errors.Is(err, errDeviceTokenExpired):
+			expiredInRow++
+			if expiredInRow >= 2 || getTokenCount() == 0 {
+				purgeExpiredTokens(tokenID)
+				expiredInRow = 0
+				if !purgedOnce {
+					purgedOnce = true
+					if !waitForDeviceTokens(ctx) {
+						logError("No fresh device tokens arrived after purging expired store")
+						return ""
+					}
+					attempt = 0
+					backoff = 250 * time.Millisecond
+					continue
+				}
+			} else {
+				attempt--
+				select {
+				case <-ctx.Done():
+					return ""
+				case <-time.After(50 * time.Millisecond):
+				}
+				continue
+			}
 		case errors.Is(err, errNoDeviceTokens):
 			// Only the collector can fix this, and it usually needs a moment, so
 			// wait and retry rather than failing the caller.
@@ -583,8 +720,10 @@ func computeFinalPayload(ctx context.Context) string {
 			}
 			continue
 		case err != nil:
+			expiredInRow = 0
 			logError(fmt.Sprintf("Captcha attempt %d/%d failed: %v", attempt, maxTokenRetries, err))
 		default:
+			expiredInRow = 0
 			logError(fmt.Sprintf("Captcha attempt %d/%d produced an empty payload", attempt, maxTokenRetries))
 		}
 
@@ -611,9 +750,14 @@ func computeFinalPayload(ctx context.Context) string {
 // meant every upstream hiccup destroyed a token the collector had to re-earn
 // through a headless browser run.
 func tryCompute(ctx context.Context) (string, error) {
+	payload, _, err := tryComputeWithID(ctx)
+	return payload, err
+}
+
+func tryComputeWithID(ctx context.Context) (string, int64, error) {
 	certifyID, err := initCaptcha(ctx)
 	if err != nil {
-		return "", fmt.Errorf("initCaptcha: %w", err)
+		return "", 0, fmt.Errorf("initCaptcha: %w", err)
 	}
 
 	argValue := generateArg(certifyID)
@@ -629,7 +773,7 @@ func tryCompute(ctx context.Context) (string, error) {
 	}
 	jsonBytes, err := jsonMarshal(track)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	h := aliHash(string(jsonBytes), "0000")
@@ -639,18 +783,18 @@ func tryCompute(ctx context.Context) (string, error) {
 	finalVal := encrypt([]byte(fb64))
 
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	deviceToken, ok := claimToken()
+	tokenID, deviceToken, ok := claimTokenWithID()
 	if !ok {
-		return "", errNoDeviceTokens
+		return "", 0, errNoDeviceTokens
 	}
 
 	payload, err := verifyCaptcha(ctx, certifyID, finalVal, deviceToken)
 	if err != nil {
-		return "", fmt.Errorf("verifyCaptcha: %w", err)
+		return "", tokenID, fmt.Errorf("verifyCaptcha: %w", err)
 	}
-	return payload, nil
+	return payload, tokenID, nil
 }
 
 // Background cache, so an agent-mode request does not pay for the handshake
@@ -712,6 +856,27 @@ func (c *CaptchaCache) Get() (string, bool) {
 		return val, true
 	}
 	return "", false
+}
+
+func (c *CaptchaCache) Put(value string) {
+	if value == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sweepLocked()
+	if len(c.params) < config.Captcha.CacheSize {
+		c.params = append(c.params, cachedCaptcha{value: value, generatedAt: time.Now()})
+	}
+}
+
+func (c *CaptchaCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.params {
+		c.params[i] = cachedCaptcha{}
+	}
+	c.params = c.params[:0]
 }
 
 // Run keeps the cache stocked while the bridge is in use, and on cancellation
@@ -817,7 +982,7 @@ func getCaptchaVerifyParam(ctx context.Context) (string, error) {
 
 	// From the caller's context, so a client that walks away stops the handshake
 	// instead of spending tokens on a reply nobody reads.
-	genCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	genCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
 	defer cancel()
 
 	type result struct {

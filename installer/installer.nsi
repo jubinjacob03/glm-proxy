@@ -16,7 +16,7 @@ SetCompressor /SOLID lzma
 !define APP_NAME    "GLM Proxy"
 !define APP_ID      "GLM-Proxy"
 !define PUBLISHER   "Jubin"
-!define APP_VERSION "2.1.8"
+!define APP_VERSION "2.1.9"
 !define TRAY_EXE    "glm-tray.exe"
 !define UNINST_KEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_ID}"
 !define RUN_KEY     "Software\Microsoft\Windows\CurrentVersion\Run"
@@ -288,7 +288,7 @@ Section "Install"
 
   ; --skip-if-stocked returns at once when a kept database already has tokens.
   DetailPrint "Collecting the first device tokens..."
-  nsExec::ExecToLog '"$INSTDIR\token-collector.exe" --no-tui --batch 2 --db-path "$INSTDIR\tokens.sqlite" --skip-if-stocked 50 --deadline 600'
+  nsExec::ExecToLog '"$INSTDIR\token-collector.exe" --no-tui --batch 2 --tokens 50000 --unsafe --db-path "$INSTDIR\tokens.sqlite" --skip-if-stocked 5000 --deadline 600'
   Pop $0
   ${If} $0 != 0
     DetailPrint "Token collection did not finish ($0). The proxy collects them on demand instead."

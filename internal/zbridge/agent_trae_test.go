@@ -456,11 +456,15 @@ func TestNativeRequestBodySignatureTrace(t *testing.T) {
 	}
 
 	var up struct {
+		ID              string                   `json:"id"`
 		Messages        []map[string]interface{} `json:"messages"`
 		SignaturePrompt string                   `json:"signature_prompt"`
 	}
 	if err := json.Unmarshal(gotBody, &up); err != nil {
 		t.Fatalf("upstream body not JSON: %v\n%s", err, gotBody)
+	}
+	if up.ID == "" {
+		t.Errorf("upstream body missing id: %s", gotBody)
 	}
 
 	// signature_prompt is the latest user turn (which carries the tool contract),
@@ -1208,5 +1212,65 @@ func TestStreamingShapeTolerance(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestChatCompletionsDefaultsToNonStreaming(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		for _, ev := range []string{
+			`{"data":{"delta_content":"hello"}}`,
+			`{"data":{"phase":"done"}}`,
+		} {
+			fmt.Fprintf(w, "data: %s\n\n", ev)
+			if fl != nil {
+				fl.Flush()
+			}
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	oldBase := BASE_URL
+	BASE_URL = upstream.URL
+	defer func() { DrainSessionGC(); BASE_URL = oldBase }()
+	defer OverrideSessionState("test-token", "test-user", true)()
+
+	cfg := GetConfig()
+	oldAgent, oldAuth := cfg.AgentMode, cfg.Auth.Enabled
+	cfg.AgentMode, cfg.Auth.Enabled = true, false
+	defer func() {
+		cfg.AgentMode, cfg.Auth.Enabled = oldAgent, oldAuth
+	}()
+	SeedCaptchaParam("test-captcha")
+
+	body := `{"model":"glm-4.7","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	NewHandler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var resp struct {
+		Object  string `json:"object"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not valid JSON: %v\n%s", err, rec.Body.String())
+	}
+	if resp.Object != "chat.completion" {
+		t.Errorf("object = %q, want chat.completion", resp.Object)
+	}
+	if len(resp.Choices) == 0 || resp.Choices[0].Message.Content != "hello" {
+		t.Errorf("unexpected choices: %+v", resp.Choices)
 	}
 }

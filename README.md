@@ -276,8 +276,9 @@ you.
 | `CAPTCHA_TTL_SECONDS`            | `75`       | Lifetime of a cached parameter                                                                       |
 | `CAPTCHA_IDLE_SECONDS`           | `120`      | Stop restocking after this much idle time, to stop burning tokens on nobody                          |
 | `TOKEN_MONITOR`                  | `true`     | Watch the device token store and replenish it automatically                                          |
-| `TOKEN_MIN`                      | `50`       | Run the collector once the store drops below this                                                    |
+| `TOKEN_MIN`                      | `5000`     | Run the collector once the store drops below this                                                    |
 | `TOKEN_COLLECT_BATCH`            | `2`        | Batches per collector run                                                                            |
+| `TOKEN_COLLECT_TOKENS`           | `50000`    | Tokens collected per batch (`2 x 50000 = 100000` per run)                                            |
 | `TOKEN_MONITOR_INTERVAL_SECONDS` | `60`       | Poll interval. Consecutive failures back this off exponentially                                      |
 | `TOKEN_COLLECT_TIMEOUT_SECONDS`  | `900`      | Kill a collector run that exceeds this                                                               |
 | `TOKEN_COLLECTOR_PATH`           | _(auto)_   | Explicit path to the collector binary; auto-detected next to the proxy or on `PATH`                  |
@@ -364,7 +365,7 @@ Anthropic clients authenticate via the `x-api-key` header (same value as `AUTH_T
 | ---------------------- | ------ | ------------- | -------------------------------------------------------------------------------------------- |
 | `model`                | string | `glm-4.7`     | Any model ID from `/v1/models`                                                               |
 | `messages`             | array  | _(required)_  | OpenAI-style message array                                                                   |
-| `stream`               | bool   | `true`        | SSE stream when true                                                                         |
+| `stream`               | bool   | `false`       | SSE stream when true                                                                         |
 | `reasoning`            | bool   | _(per-model)_ | Enables `enable_thinking` for this request                                                   |
 | `thinking`             | object | _(per-model)_ | `{"type":"enabled"}` or `{"type":"disabled"}` → `enable_thinking`                            |
 | `reasoning_effort`     | string | _(empty)_     | `"high"` or `"max"` — only forwarded if the model supports it; forces `enable_thinking=true` |

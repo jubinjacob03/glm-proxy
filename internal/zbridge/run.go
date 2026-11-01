@@ -423,8 +423,12 @@ func tokenMonitor(ctx context.Context) {
 
 	// Requests may now wait on this loop instead of failing, so advertise that it
 	// exists and is working.
+	collectorAvailable.Store(true)
 	collectorHealthy.Store(true)
-	defer collectorHealthy.Store(false)
+	defer func() {
+		collectorAvailable.Store(false)
+		collectorHealthy.Store(false)
+	}()
 
 	// Consecutive failures back the loop off, so a collector that cannot succeed
 	// (bad credentials, no browser, locked database) is not relaunched forever.
@@ -432,6 +436,11 @@ func tokenMonitor(ctx context.Context) {
 
 	for {
 		count := getTokenCount()
+		if count >= config.TokenMonitor.MinTokens && shouldProbeTokenStore() {
+			if !probeStoredTokens(ctx) {
+				count = getTokenCount()
+			}
+		}
 		if count < config.TokenMonitor.MinTokens {
 			logConsolef("[Tokens] low water mark: %d < %d, running collector",
 				count, config.TokenMonitor.MinTokens)
@@ -441,18 +450,21 @@ func tokenMonitor(ctx context.Context) {
 					return
 				}
 				failures++
+				lastCollectorFailAtNs.Store(time.Now().UnixNano())
 				collectorHealthy.Store(false)
 				metrics.collectorFailures.Add(1)
 				logErrorf("[Tokens] collector failed (%d consecutive): %v", failures, err)
 			} else {
 				failures = 0
 				collectorHealthy.Store(true)
+				lastTokenVerifiedAtNs.Store(time.Now().UnixNano())
 				metrics.collectorRuns.Add(1)
 				metrics.collectorLastRun.Store(time.Now().Unix())
 				logConsolef("[Tokens] collector finished; %d tokens available", refreshTokenCount())
 			}
 		} else {
 			failures = 0
+			collectorHealthy.Store(true)
 		}
 
 		wait := config.TokenMonitor.Interval
@@ -463,11 +475,8 @@ func tokenMonitor(ctx context.Context) {
 			logWarnf("[Tokens] backing off for %s after %d failures", wait, failures)
 		}
 
-		// While the collector succeeds, a request that hit an empty store can cut
-		// the wait short. A nil channel blocks forever in select, so once runs
-		// fail the backoff is honoured instead of bypassed by every request.
 		var demand <-chan struct{}
-		if failures == 0 {
+		if failures == 0 || time.Since(time.Unix(0, lastCollectorFailAtNs.Load())) >= 15*time.Second {
 			demand = tokenDemand
 		}
 
@@ -475,6 +484,7 @@ func tokenMonitor(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-demand:
+			collectorHealthy.Store(true)
 			logConsolef("[Tokens] a request is waiting on tokens; collecting now")
 		case <-time.After(wait):
 		}

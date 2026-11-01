@@ -164,6 +164,7 @@ func initializeSession() error {
 func doInitializeSession() error {
 	if config.ZaiToken != "" {
 		logInfof("[Session] Using ZAI_TOKEN from the environment, skipping guest init.")
+		scrapeConfig()
 		id, name := decodeJWT(config.ZaiToken)
 
 		session.mu.Lock()
@@ -471,6 +472,7 @@ func sendToZAIStream(ctx context.Context, prompt string, opts struct {
 		requestBody := map[string]interface{}{
 			"model":                opts.Model,
 			"chat_id":              opts.ChatID,
+			"id":                   randomUUID(),
 			"messages":             messagesField,
 			"signature_prompt":     sigContent,
 			"stream":               true,

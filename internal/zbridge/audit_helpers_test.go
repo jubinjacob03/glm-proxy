@@ -1,10 +1,14 @@
 package zbridge
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -296,5 +300,155 @@ func TestCheckAuthAcceptsAnyConfiguredKey(t *testing.T) {
 	r.Header.Set("x-api-key", "unlimited")
 	if !checkAuth(r) {
 		t.Error("unlimited via x-api-key should be accepted")
+	}
+}
+
+func TestExpiredTokensPurgedAndRefilledOnDemand(t *testing.T) {
+	oldDBPath := dbPath
+	dbPath = filepath.Join(t.TempDir(), "tokens.sqlite")
+	defer func() {
+		closeDB()
+		dbPath = oldDBPath
+	}()
+	if err := initDB(); err != nil {
+		t.Fatalf("initDB: %v", err)
+	}
+
+	tx, err := globalDB.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	for i := 1; i <= 500; i++ {
+		if _, err := tx.Exec(`INSERT INTO tokens (token, batch) VALUES (?, 1)`, fmt.Sprintf("expired-tok-%d", i)); err != nil {
+			t.Fatalf("insert expired: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := refreshTokenCount(); got != 500 {
+		t.Fatalf("initial count = %d, want 500", got)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		switch r.FormValue("Action") {
+		case "InitCaptchaV3":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"CertifyId":"cert-test-123456"}`))
+		case "VerifyCaptchaV3":
+			var cvp CVP
+			_ = json.Unmarshal([]byte(r.FormValue("CaptchaVerifyParam")), &cvp)
+			w.Header().Set("Content-Type", "application/json")
+			if strings.HasPrefix(cvp.DeviceToken, "fresh-tok-") {
+				_, _ = w.Write([]byte(`{"Success":true,"Result":{"VerifyResult":true,"securityToken":"sec-ok","certifyId":"cert-test-123456"}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"Success":true,"Result":{"VerifyResult":false}}`))
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	oldInit, oldVerify := aliyunInitURL, aliyunVerifyURL
+	aliyunInitURL, aliyunVerifyURL = srv.URL, srv.URL
+	defer func() {
+		aliyunInitURL, aliyunVerifyURL = oldInit, oldVerify
+	}()
+
+	select {
+	case <-tokenDemand:
+	default:
+	}
+	collectorAvailable.Store(true)
+	collectorHealthy.Store(true)
+	defer func() {
+		collectorAvailable.Store(false)
+		collectorHealthy.Store(false)
+	}()
+
+	refillDone := make(chan struct{})
+	go func() {
+		defer close(refillDone)
+		<-tokenDemand
+		for i := 1; i <= 5; i++ {
+			_, _ = globalDB.Exec(`INSERT INTO tokens (token, batch) VALUES (?, 2)`, fmt.Sprintf("fresh-tok-%d", i))
+		}
+		refreshTokenCount()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	payload := computeFinalPayload(ctx)
+	if payload == "" {
+		t.Fatal("computeFinalPayload returned empty payload; expected auto-purge and refill recovery")
+	}
+	<-refillDone
+
+	var expiredLeft int
+	if err := globalDB.QueryRow(`SELECT COUNT(*) FROM tokens WHERE token LIKE 'expired-tok-%'`).Scan(&expiredLeft); err != nil {
+		t.Fatalf("count expired: %v", err)
+	}
+	if expiredLeft != 0 {
+		t.Errorf("expired tokens remaining = %d, want 0", expiredLeft)
+	}
+	if got := refreshTokenCount(); got != 4 {
+		t.Errorf("remaining fresh tokens = %d, want 4", got)
+	}
+}
+
+func TestProbeStoredTokensPurgesExpiredAndCachesValid(t *testing.T) {
+	oldDBPath := dbPath
+	dbPath = filepath.Join(t.TempDir(), "tokens.sqlite")
+	defer func() {
+		closeDB()
+		dbPath = oldDBPath
+	}()
+	if err := initDB(); err != nil {
+		t.Fatalf("initDB: %v", err)
+	}
+
+	for i := 1; i <= 10; i++ {
+		_, _ = globalDB.Exec(`INSERT INTO tokens (token, batch) VALUES (?, 1)`, fmt.Sprintf("expired-tok-%d", i))
+	}
+	refreshTokenCount()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		switch r.FormValue("Action") {
+		case "InitCaptchaV3":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"CertifyId":"cert-probe-123"}`))
+		case "VerifyCaptchaV3":
+			var cvp CVP
+			_ = json.Unmarshal([]byte(r.FormValue("CaptchaVerifyParam")), &cvp)
+			w.Header().Set("Content-Type", "application/json")
+			if strings.HasPrefix(cvp.DeviceToken, "fresh-tok-") {
+				_, _ = w.Write([]byte(`{"Success":true,"Result":{"VerifyResult":true,"securityToken":"sec-ok","certifyId":"cert-probe-123"}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"Success":true,"Result":{"VerifyResult":false}}`))
+			}
+		}
+	}))
+	defer srv.Close()
+
+	oldInit, oldVerify := aliyunInitURL, aliyunVerifyURL
+	aliyunInitURL, aliyunVerifyURL = srv.URL, srv.URL
+	defer func() {
+		aliyunInitURL, aliyunVerifyURL = oldInit, oldVerify
+	}()
+
+	if probeStoredTokens(context.Background()) {
+		t.Fatal("probeStoredTokens should return false when stored tokens are expired")
+	}
+	if got := refreshTokenCount(); got != 0 {
+		t.Fatalf("token count after expired probe = %d, want 0", got)
+	}
+
+	_, _ = globalDB.Exec(`INSERT INTO tokens (token, batch) VALUES ('fresh-tok-1', 2)`)
+	refreshTokenCount()
+	if !probeStoredTokens(context.Background()) {
+		t.Fatal("probeStoredTokens should return true when stored token is valid")
 	}
 }

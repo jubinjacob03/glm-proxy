@@ -19,7 +19,7 @@ const (
 
 	// Z.AI wire constants.
 	SALT_KEY           = "key-@@@@)))()((9))-xxxx&&&%%%%%"
-	DEFAULT_FE_VERSION = "prod-fe-1.1.92"
+	DEFAULT_FE_VERSION = "prod-fe-1.1.123"
 	zaiUserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
@@ -214,10 +214,10 @@ func loadConfig() *Config {
 	c.TokenMonitor.Enabled = true
 	// One token is spent per request, so the refill has to start while there is
 	// still enough stock to cover the collector's own run time under load.
-	c.TokenMonitor.MinTokens = 750
+	c.TokenMonitor.MinTokens = 5000
 	c.TokenMonitor.Interval = 60 * time.Second
 	c.TokenMonitor.Batch = 2
-	c.TokenMonitor.PerBatch = 5000
+	c.TokenMonitor.PerBatch = 50000
 	c.TokenMonitor.RunTimeout = 30 * time.Minute
 	c.StreamHoldback = 24
 	c.SyncMode = false

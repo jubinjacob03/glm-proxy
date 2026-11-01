@@ -42,10 +42,10 @@ import (
 )
 
 const (
-	MaxTokens       = 20000
-	UnsafeMaxTokens = 50000
-	DefaultTokens   = 5000
-	DefaultBatch    = 5
+	MaxTokens       = 50000
+	UnsafeMaxTokens = 100000
+	DefaultTokens   = 50000
+	DefaultBatch    = 2
 	MaxBatch        = 9
 	UnsafeMaxBatch  = 25
 	SendWaitMs      = 15000
@@ -1250,13 +1250,25 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
 	t0 := time.Now()
 
 	type evalResult struct {
-		val interface{}
-		err error
+		tokens   []string
+		rejected int
+		rawCount int
+		err      error
 	}
 	resultCh := make(chan evalResult, 1)
 
 	go func() {
-		val, err := page.Evaluate(`async (args) => {
+		const chunkSize = 10000
+		tokens := make([]string, 0, total)
+		rejected := 0
+		rawCount := 0
+		remaining := total
+		for remaining > 0 {
+			step := remaining
+			if step > chunkSize {
+				step = chunkSize
+			}
+			val, err := page.Evaluate(`async (args) => {
             const total = args.total;
             const provider = window.z_um || window.um;
             if (!provider || typeof provider.getToken !== 'function') {
@@ -1266,45 +1278,50 @@ func collectTokensOnPage(page playwright.Page, total int) ([]string, error) {
             for (let i = 0; i < total; i++) {
                 const tok = provider.getToken();
                 out[i] = (tok && typeof tok.then === 'function') ? await tok : tok;
-                if (i % 50 === 0) {
+                if (i % 500 === 0) {
                     await new Promise(r => setTimeout(r, 0));
                 }
             }
             return out;
-        }`, map[string]interface{}{"total": total})
-		resultCh <- evalResult{val, err}
+        }`, map[string]interface{}{"total": step})
+			if err != nil {
+				resultCh <- evalResult{err: fmt.Errorf("evaluate: %w", err)}
+				return
+			}
+			arr, ok := val.([]interface{})
+			if !ok {
+				resultCh <- evalResult{err: fmt.Errorf("unexpected evaluate result type: %T", val)}
+				return
+			}
+			rawCount += len(arr)
+			for _, v := range arr {
+				s, isString := v.(string)
+				if !isString || !validDeviceToken(s) {
+					rejected++
+					continue
+				}
+				tokens = append(tokens, s)
+			}
+			remaining -= step
+		}
+		resultCh <- evalResult{tokens: tokens, rejected: rejected, rawCount: rawCount}
 	}()
 
 	select {
 	case res := <-resultCh:
 		if res.err != nil {
-			return nil, fmt.Errorf("evaluate: %w", res.err)
+			return nil, res.err
 		}
-		arr, ok := res.val.([]interface{})
-		if !ok {
-			return nil, fmt.Errorf("unexpected evaluate result type: %T", res.val)
+		if res.rejected > 0 {
+			logWarn("discarded %d malformed value(s) the page returned instead of a token", res.rejected)
 		}
-		// Exact capacity, so the append loop never reallocates.
-		tokens := make([]string, 0, len(arr))
-		rejected := 0
-		for _, v := range arr {
-			s, isString := v.(string)
-			if !isString || !validDeviceToken(s) {
-				rejected++
-				continue
-			}
-			tokens = append(tokens, s)
-		}
-		if rejected > 0 {
-			logWarn("discarded %d malformed value(s) the page returned instead of a token", rejected)
-		}
-		if len(tokens) == 0 {
+		if len(res.tokens) == 0 {
 			return nil, fmt.Errorf("the page returned %d value(s), none of them a device token: "+
-				"the captcha bundle loaded but did not initialise", len(arr))
+				"the captcha bundle loaded but did not initialise", res.rawCount)
 		}
 		elapsed := time.Since(t0).Seconds()
-		logOK("collected %d tokens in %.2fs", len(tokens), elapsed)
-		return tokens, nil
+		logOK("collected %d tokens in %.2fs", len(res.tokens), elapsed)
+		return res.tokens, nil
 
 	case <-time.After(tokenCollectionBudget(total)):
 		return nil, fmt.Errorf("token collection timed out after %ds", int(tokenCollectionBudget(total)/time.Second))
